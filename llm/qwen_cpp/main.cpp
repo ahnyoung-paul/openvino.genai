@@ -161,6 +161,7 @@ struct Args
   bool stateful = false;
   int num_iteration = 1;
   bool force_max_generation = 0;
+  std::vector<int32_t> selected_inputs;
 };
 
 static auto usage(const std::string &prog) -> void
@@ -181,7 +182,8 @@ static auto usage(const std::string &prog) -> void
             << "  -s, --stateful STATEFUL specify whether to use stateful model, default use stateless model\n"
             << "  -n  --num_iteration     specify how many iteration used for text sentence, (default: 1)\n "
             << "  -f  --force_max_generation     force llm to generate to max_context_length, (default: 0)\n "
-            << "  -v, --verbose           display verbose output including config/system/performance info\n";
+            << "  -v, --verbose           display verbose output including config/system/performance info\n"
+            << "  -i, --select_inputs         set input ids to run with comma separated list (ex: \"1,3,1,3\")\n";
 }
 
 static auto parse_args(const std::vector<std::string> &argv) -> Args
@@ -244,6 +246,27 @@ static auto parse_args(const std::vector<std::string> &argv) -> Args
     else if (arg == "-v" || arg == "--verbose")
     {
       args.verbose = true;
+    }
+    else if (arg == "-i" || arg == "--select_inputs") {
+        std::string inputs_str = argv[++i];
+        auto get_input_indices = [&]() {
+            std::vector<int> input_ids;
+            size_t pos_begin = 0;
+            size_t pos_end = 0;
+            while((pos_end = inputs_str.find(",", pos_begin)) != std::string::npos) {
+                std::string id_str = inputs_str.substr(pos_begin, (pos_end - pos_begin));
+                args.selected_inputs.push_back(std::stoi(id_str));
+                pos_begin = pos_end + 1;
+            }
+            std::string id_str = inputs_str.substr(pos_begin);
+            args.selected_inputs.push_back(std::stoi(id_str));
+        };
+        get_input_indices();
+        std::cout << "Selected input indices : " << std::endl;
+        for (auto i : args.selected_inputs) {
+            std::cout << i << " ";
+        }
+        std::cout << std::endl;
     }
     else
     {
@@ -389,10 +412,26 @@ int main(int argc, char **argv)
         }
       }
 
-      for (std::string input_text : sentences)
-      {
+      const size_t num_sentences = sentences.size();
+      std::vector<int32_t> sentences_to_run;
+      if (args.selected_inputs.size() > 0)
+          sentences_to_run = args.selected_inputs;
+      else {
+          for (size_t i = 0; i < num_sentences; ++i)
+              sentences_to_run.push_back(i);
+      }
+
+      std::vector<std::string> perf_records;
+      perf_records.push_back("Build_number: " + std::string(ov::get_openvino_version().buildNumber));
+      std::string title = "Text Sentence #,First inference took,Input token length,Output token length,Other inference took in total,Average other token latency,Average inference speed";
+      perf_records.push_back(title);
+
+      for (int32_t input_id : sentences_to_run) {
+        auto input_text = sentences[input_id];
+        std::stringstream ss;
         // Build input prompt with prompt template
         std::cout << "******************************************* Text Sentence #" << sentence_num << " Start *******************************************\n";
+        ss << sentence_num << ",";
         startTime = Time::now();
         std::vector<int> input_ids = tokenizer->encode_history({input_text}, args.max_length);
         duration_ms = get_duration_ms_until_now(startTime);
@@ -436,13 +475,14 @@ int main(int argc, char **argv)
           else
           {
             max_context_length = args.max_context_length;
-	  }
+	        }
 
           // First inference
           startTime = Time::now();
           ireq.infer();
           duration_ms = get_duration_ms_until_now(startTime);
           std::cout << "First inference took " << duration_ms << " ms" << std::endl;
+          ss << duration_ms << ",";
 
           // Get first inference results
           size_t vocab_size = ireq.get_tensor("logits").get_shape().back();
@@ -497,13 +537,18 @@ int main(int argc, char **argv)
             std::cout << "Other inference took in total: " << total_time << " ms, Average other token latency: " << total_time / (count - 1) << " ms" << std::endl;
             std::cout << "Input num tokens: " << input_ids.size() << ", output num tokens: " << count << ", Average inference speed: " << (count - 1) / total_time * 1000.0 << " token/s\n";
           }
+          ss << input_ids.size() << "," << count << "," << total_time << "," << (total_time / (count - 1)) << "," << ((count - 1) / total_time * 1000.0);
           std::cout << "******************************************* Text Sentence #" << sentence_num << " Finished ****************************************\n\n";
+          perf_records.push_back(ss.str());
         }
         sentence_num += 1;
       }
       if (text_streamer)
       {
         text_streamer->end();
+      }
+      for (auto r : perf_records) {
+        std::cout << r << std::endl;
       }
     }
   }
