@@ -484,6 +484,12 @@ int main(int argc, char **argv)
           std::cout << "First inference took " << duration_ms << " ms" << std::endl;
           ss << duration_ms << ",";
 
+          if (max_context_length == 0) {
+            std::cout << "only allowed first latency" << std::endl;
+            std::cout << ss.str() << std::endl;
+            return 0;
+          }
+
           // Get first inference results
           size_t vocab_size = ireq.get_tensor("logits").get_shape().back();
           float *logits = ireq.get_tensor("logits").data<float>();
