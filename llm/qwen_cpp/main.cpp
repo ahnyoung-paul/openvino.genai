@@ -469,7 +469,7 @@ int main(int argc, char **argv)
 
           std::cout << "Input token length: " << input_ids.size() << "\n";
           int max_context_length = args.max_context_length;
-          if (input_text.size() > 1000)
+          if (input_idx == 4)
           {
             max_context_length = args.max_context_length * 2;
           }
