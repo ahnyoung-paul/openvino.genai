@@ -16,6 +16,41 @@ size_t VLMPerfMetrics::get_total_image_slice_count() {
     return total_image_slice_count;
 }
 
+MeanStdPair VLMPerfMetrics::get_adapter_switch_duration() {
+    evaluate_statistics();
+    return adapter_switch_duration;
+}
+
+MeanStdPair VLMPerfMetrics::get_adapter_prepare_weight_getters_duration() {
+    evaluate_statistics();
+    return adapter_prepare_weight_getters_duration;
+}
+
+MeanStdPair VLMPerfMetrics::get_adapter_query_state_duration() {
+    evaluate_statistics();
+    return adapter_query_state_duration;
+}
+
+MeanStdPair VLMPerfMetrics::get_adapter_set_lora_tensors_duration() {
+    evaluate_statistics();
+    return adapter_set_lora_tensors_duration;
+}
+
+MeanStdPair VLMPerfMetrics::get_adapter_prepare_tensors_duration() {
+    evaluate_statistics();
+    return adapter_prepare_tensors_duration;
+}
+
+MeanStdPair VLMPerfMetrics::get_adapter_set_state_duration() {
+    evaluate_statistics();
+    return adapter_set_state_duration;
+}
+
+MeanStdPair VLMPerfMetrics::get_adapter_set_constants_duration() {
+    evaluate_statistics();
+    return adapter_set_constants_duration;
+}
+
 void VLMPerfMetrics::evaluate_statistics(std::optional<TimePoint> start_time) {
     if (m_evaluated) {
         return;
@@ -26,6 +61,15 @@ void VLMPerfMetrics::evaluate_statistics(std::optional<TimePoint> start_time) {
     for (const auto count : vlm_raw_metrics.per_image_slice_counts) {
         total_image_slice_count += count;
     }
+    adapter_switch_duration = ov::genai::calc_mean_and_std(vlm_raw_metrics.adapter_switch_durations);
+    // adapter apply sub-phases
+    auto& raw = vlm_raw_metrics;
+    adapter_prepare_weight_getters_duration = calc_mean_and_std(raw.adapter_prepare_weight_getters_durations);
+    adapter_query_state_duration = calc_mean_and_std(raw.adapter_query_state_durations);
+    adapter_set_lora_tensors_duration = calc_mean_and_std(raw.adapter_set_lora_tensors_durations);
+    adapter_prepare_tensors_duration = calc_mean_and_std(raw.adapter_prepare_tensors_durations);
+    adapter_set_state_duration = calc_mean_and_std(raw.adapter_set_state_durations);
+    adapter_set_constants_duration = calc_mean_and_std(raw.adapter_set_constants_durations);
     PerfMetrics::evaluate_statistics(start_time);
 };
 
@@ -45,6 +89,12 @@ VLMPerfMetrics VLMPerfMetrics::operator+(const VLMPerfMetrics& right) const {
     result_per_image_slice_counts.insert(result_per_image_slice_counts.end(),
                                          right_per_image_slice_counts.begin(),
                                          right_per_image_slice_counts.end());
+
+    auto& result_adapter_switch_durations = result.vlm_raw_metrics.adapter_switch_durations;
+    auto& right_adapter_switch_durations = right.vlm_raw_metrics.adapter_switch_durations;
+    result_adapter_switch_durations.insert(result_adapter_switch_durations.end(),
+                                           right_adapter_switch_durations.begin(),
+                                           right_adapter_switch_durations.end());
     return result;
 }
 }

@@ -572,7 +572,14 @@ std::vector<EncodedGenerationResult> ContinuousBatchingPipeline::ContinuousBatch
         OPENVINO_ASSERT(sampling_params[i - 1].adapters == sampling_params[i].adapters,
                         "LoRA adapters value must be the same for all requests");
     }
+    auto adapter_switch_start = std::chrono::steady_clock::now();
     set_adapters(sampling_params[0].adapters);
+    auto adapter_switch_end = std::chrono::steady_clock::now();
+    m_last_adapter_switch_duration = MicroSeconds(PerfMetrics::get_microsec(adapter_switch_end - adapter_switch_start));
+    // Sub-phase profiling
+    if (m_adapter_controller) {
+        m_last_apply_profile = m_adapter_controller->get_last_apply_profile();
+    }
 
     // RAII guard so the flag is restored on every exit path (including exceptions).
     struct HiddenStateExportGuard {

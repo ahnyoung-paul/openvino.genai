@@ -189,6 +189,19 @@ class OPENVINO_GENAI_EXPORTS AdapterController {
 
 public:
 
+    struct ApplyProfile {
+        float prepare_weight_getters_us = 0.0f;
+        float query_state_us = 0.0f;
+        float set_lora_tensors_us = 0.0f;
+        // Split of set_lora_tensors into ownership-attributable sub-phases:
+        //   prepare_tensors_us -> prepared-output cache lookup/fill (prepare_lora_tensors on miss)
+        //   set_state_us        -> OpenVINO GPU plugin state upload (VariableState::set_state)
+        float prepare_tensors_us = 0.0f;
+        float set_state_us = 0.0f;
+        float set_constants_us = 0.0f;
+    };
+    ApplyProfile get_last_apply_profile() const;
+
     AdapterController() = default;
 
     AdapterController(std::shared_ptr<ov::Model> model, const AdapterConfig& config, std::string device);

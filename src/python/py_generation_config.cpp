@@ -18,6 +18,7 @@ using ov::genai::StructuralTagItem;
 using ov::genai::StructuralTagsConfig;
 using ov::genai::StructuredOutputConfig;
 using ov::genai::GenerationConfig;
+using ov::genai::Parser;
 
 namespace {
 
@@ -456,7 +457,16 @@ void init_generation_config(py::module_& m) {
         .def_readwrite("include_stop_str_in_output", &GenerationConfig::include_stop_str_in_output)
         .def_readwrite("stop_token_ids", &GenerationConfig::stop_token_ids)
         .def_readwrite("structured_output_config", &GenerationConfig::structured_output_config)
-        .def_readwrite("parsers", &GenerationConfig::parsers, py::keep_alive<1, 2>())
+        // py::keep_alive is not supported as a def_property extra; apply it on the setter cpp_function instead.
+        .def_property("parsers",
+                       [](GenerationConfig& self) {
+                           return self.parsers;
+                       },
+                       py::cpp_function(
+                           [](GenerationConfig& self, std::vector<std::shared_ptr<Parser>> value) {
+                               self.parsers = std::move(value);
+                           },
+                           py::keep_alive<1, 2>()))
         .def_readwrite("adapters", &GenerationConfig::adapters)
         .def_readwrite("apply_chat_template", &GenerationConfig::apply_chat_template)
         .def_readwrite("return_omni_outputs", &GenerationConfig::return_omni_outputs)
