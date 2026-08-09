@@ -504,6 +504,18 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
         gen_result.extended_perf_metrics = result.extended_perf_metrics;
 
         gen_result.perf_metrics.vlm_raw_metrics = vlm_perf_metrics[i].vlm_raw_metrics;
+        if (m_last_adapter_switch_duration.count() > 0) {
+            gen_result.perf_metrics.vlm_raw_metrics.adapter_switch_durations.emplace_back(m_last_adapter_switch_duration);
+            // adapter apply sub-phase profiling
+            gen_result.perf_metrics.vlm_raw_metrics.adapter_prepare_weight_getters_durations.emplace_back(m_last_apply_profile.prepare_weight_getters_us);
+            gen_result.perf_metrics.vlm_raw_metrics.adapter_query_state_durations.emplace_back(m_last_apply_profile.query_state_us);
+            gen_result.perf_metrics.vlm_raw_metrics.adapter_set_lora_tensors_durations.emplace_back(m_last_apply_profile.set_lora_tensors_us);
+            // set_lora_tensors split: prepare_tensors (GenAI/CPU concat) vs set_state (GPU plugin upload)
+            gen_result.perf_metrics.vlm_raw_metrics.adapter_prepare_tensors_durations.emplace_back(m_last_apply_profile.prepare_tensors_us);
+            gen_result.perf_metrics.vlm_raw_metrics.adapter_set_state_durations.emplace_back(m_last_apply_profile.set_state_us);
+            gen_result.perf_metrics.vlm_raw_metrics.adapter_set_constants_durations.emplace_back(m_last_apply_profile.set_constants_us);
+        }
+
         gen_result.perf_metrics.raw_metrics.tokenization_durations = vlm_perf_metrics[i].raw_metrics.tokenization_durations;
         gen_result.perf_metrics.raw_metrics.chat_template_durations = vlm_perf_metrics[i].raw_metrics.chat_template_durations;
         gen_result.perf_metrics.raw_metrics.detokenization_durations = vlm_perf_metrics[i].raw_metrics.detokenization_durations;
@@ -737,6 +749,18 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
         gen_result.extended_perf_metrics = result.extended_perf_metrics;
 
         gen_result.perf_metrics.vlm_raw_metrics = vlm_perf_metrics[i].vlm_raw_metrics;
+        if (m_last_adapter_switch_duration.count() > 0) {
+            gen_result.perf_metrics.vlm_raw_metrics.adapter_switch_durations.emplace_back(m_last_adapter_switch_duration);
+            // adapter apply sub-phase profiling
+            gen_result.perf_metrics.vlm_raw_metrics.adapter_prepare_weight_getters_durations.emplace_back(m_last_apply_profile.prepare_weight_getters_us);
+            gen_result.perf_metrics.vlm_raw_metrics.adapter_query_state_durations.emplace_back(m_last_apply_profile.query_state_us);
+            gen_result.perf_metrics.vlm_raw_metrics.adapter_set_lora_tensors_durations.emplace_back(m_last_apply_profile.set_lora_tensors_us);
+            // set_lora_tensors split: prepare_tensors (GenAI/CPU concat) vs set_state (GPU plugin upload)
+            gen_result.perf_metrics.vlm_raw_metrics.adapter_prepare_tensors_durations.emplace_back(m_last_apply_profile.prepare_tensors_us);
+            gen_result.perf_metrics.vlm_raw_metrics.adapter_set_state_durations.emplace_back(m_last_apply_profile.set_state_us);
+            gen_result.perf_metrics.vlm_raw_metrics.adapter_set_constants_durations.emplace_back(m_last_apply_profile.set_constants_us);
+        }
+
         gen_result.perf_metrics.raw_metrics.tokenization_durations = vlm_perf_metrics[i].raw_metrics.tokenization_durations;
         gen_result.perf_metrics.raw_metrics.chat_template_durations = vlm_perf_metrics[i].raw_metrics.chat_template_durations;
         gen_result.perf_metrics.raw_metrics.detokenization_durations = vlm_perf_metrics[i].raw_metrics.detokenization_durations;

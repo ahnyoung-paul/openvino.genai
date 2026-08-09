@@ -499,6 +499,23 @@ public:
             perf_metrics.vlm_raw_metrics.per_image_slice_counts.begin(),
             perf_metrics.vlm_raw_metrics.per_image_slice_counts.end()
         );
+        // lora switching duration
+        decoded.perf_metrics.vlm_raw_metrics.adapter_switch_durations.insert(
+            decoded.perf_metrics.vlm_raw_metrics.adapter_switch_durations.end(),
+            perf_metrics.vlm_raw_metrics.adapter_switch_durations.begin(),
+            perf_metrics.vlm_raw_metrics.adapter_switch_durations.end()
+        );
+        // lora apply sub-phase durations (prepare_tensors / set_state split)
+        decoded.perf_metrics.vlm_raw_metrics.adapter_prepare_tensors_durations.insert(
+            decoded.perf_metrics.vlm_raw_metrics.adapter_prepare_tensors_durations.end(),
+            perf_metrics.vlm_raw_metrics.adapter_prepare_tensors_durations.begin(),
+            perf_metrics.vlm_raw_metrics.adapter_prepare_tensors_durations.end()
+        );
+        decoded.perf_metrics.vlm_raw_metrics.adapter_set_state_durations.insert(
+            decoded.perf_metrics.vlm_raw_metrics.adapter_set_state_durations.end(),
+            perf_metrics.vlm_raw_metrics.adapter_set_state_durations.begin(),
+            perf_metrics.vlm_raw_metrics.adapter_set_state_durations.end()
+        );
 
         // Evaluate statistics
         decoded.perf_metrics.m_evaluated = false;
@@ -653,6 +670,23 @@ public:
             decoded.perf_metrics.vlm_raw_metrics.per_image_slice_counts.end(),
             perf_metrics.vlm_raw_metrics.per_image_slice_counts.begin(),
             perf_metrics.vlm_raw_metrics.per_image_slice_counts.end()
+        );
+        // lora switching duration
+        decoded.perf_metrics.vlm_raw_metrics.adapter_switch_durations.insert(
+            decoded.perf_metrics.vlm_raw_metrics.adapter_switch_durations.end(),
+            perf_metrics.vlm_raw_metrics.adapter_switch_durations.begin(),
+            perf_metrics.vlm_raw_metrics.adapter_switch_durations.end()
+        );
+        // lora apply sub-phase durations (prepare_tensors / set_state split)
+        decoded.perf_metrics.vlm_raw_metrics.adapter_prepare_tensors_durations.insert(
+            decoded.perf_metrics.vlm_raw_metrics.adapter_prepare_tensors_durations.end(),
+            perf_metrics.vlm_raw_metrics.adapter_prepare_tensors_durations.begin(),
+            perf_metrics.vlm_raw_metrics.adapter_prepare_tensors_durations.end()
+        );
+        decoded.perf_metrics.vlm_raw_metrics.adapter_set_state_durations.insert(
+            decoded.perf_metrics.vlm_raw_metrics.adapter_set_state_durations.end(),
+            perf_metrics.vlm_raw_metrics.adapter_set_state_durations.begin(),
+            perf_metrics.vlm_raw_metrics.adapter_set_state_durations.end()
         );
 
         // Evaluate statistics
@@ -831,7 +865,20 @@ private:
         }
 
         if (m_adapter_controller) {
+            auto adapter_switch_start = std::chrono::steady_clock::now();
             m_adapter_controller->apply(m_language, generation_config.adapters);
+            auto adapter_switch_end = std::chrono::steady_clock::now();
+            perf_metrics.vlm_raw_metrics.adapter_switch_durations.emplace_back(
+                PerfMetrics::get_microsec(adapter_switch_end - adapter_switch_start));
+
+            // Sub-phase profiling
+            auto profile = m_adapter_controller->get_last_apply_profile();
+            perf_metrics.vlm_raw_metrics.adapter_prepare_weight_getters_durations.emplace_back(MicroSeconds(profile.prepare_weight_getters_us));
+            perf_metrics.vlm_raw_metrics.adapter_query_state_durations.emplace_back(MicroSeconds(profile.query_state_us));
+            perf_metrics.vlm_raw_metrics.adapter_set_lora_tensors_durations.emplace_back(MicroSeconds(profile.set_lora_tensors_us));
+            perf_metrics.vlm_raw_metrics.adapter_prepare_tensors_durations.emplace_back(MicroSeconds(profile.prepare_tensors_us));
+            perf_metrics.vlm_raw_metrics.adapter_set_state_durations.emplace_back(MicroSeconds(profile.set_state_us));
+            perf_metrics.vlm_raw_metrics.adapter_set_constants_durations.emplace_back(MicroSeconds(profile.set_constants_us));
         }
 
         std::vector<SequenceGroup::Ptr> requests;
