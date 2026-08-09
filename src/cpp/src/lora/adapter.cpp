@@ -39,8 +39,29 @@
 #include "openvino/pass/graph_rewrite.hpp"
 #include "openvino/pass/manager.hpp"
 
+// CVS-187607: RemoteTensor no-copy LoRA switch path.
+//
+// Baseline behaviour: the LoRA concat evaluator always runs on CPU, so its output is a
+// host tensor. Handing that to ov::VariableState::set_state() makes the GPU plugin
+// perform a blocking host->device copy -- 756 of them per adapter switch, ~95% of the
+// measured switch time.
+//
+// With this path enabled the evaluator runs on the inference device and writes into
+// device-local output tensors, so set_state() adopts them via a no-copy pointer swap
+// (requires OV_LORA_NO_COPY_SWAP=1 on the OpenVINO GPU plugin side).
+//
+// Compile-time toggle: comment out the #define to build the original host-copy path
+// only. Runtime toggle (when compiled in): OV_LORA_EVALUATOR_DEVICE, see
+// lora_evaluator_device(). Default without the env var stays on CPU, i.e. the original
+// behaviour, so enabling this macro alone changes nothing.
+#define LORA_USE_REMOTE_TENSOR
+
 #include "openvino/genai/lora_adapter.hpp"
 #include "openvino/genai/perf_metrics.hpp"
+
+#ifdef LORA_USE_REMOTE_TENSOR
+#include "openvino/runtime/remote_context.hpp"
+#endif
 
 #include "utils.hpp"
 #include "lora/common.hpp"
@@ -755,6 +776,15 @@ public:
         return requests.count(signature);
     }
 
+#ifdef LORA_USE_REMOTE_TENSOR
+    // CVS-187607: true when the evaluator runs on a non-CPU (GPU) device, so its output
+    // tensors can be allocated in device memory and handed to VariableState::set_state
+    // for a no-copy swap instead of a host->device copy.
+    bool on_device() const {
+        return !device.empty() && device.find("CPU") == std::string::npos;
+    }
+#endif
+
     void insert (const Signature& signature, ov::ResultVector& results, ov::ParameterVector& parameters) {
         // Detect Parameter -> Result patterns and do not allow them to be included into compiled model to avoid unnecessary overheads, and handle them via a bypass.
         // Assume that each parameter from parameters vector do not have other consumers outside model formed by parameters -> ... -> results.
@@ -807,9 +837,32 @@ public:
         for(size_t i = 0; i < rwb.inputs.size(); ++i) {
             request.set_input_tensor(i, inputs[rwb.inputs[i]]);
         }
+
+#ifdef LORA_USE_REMOTE_TENSOR
+        const bool device_output = on_device();
+        // CVS-187607: bind DEVICE-LOCAL output tensors created through the remote context.
+        // Note that request.get_output_tensor() would hand back a USMHostTensor (host-accessible
+        // USM), which still triggers a host->device copy in set_state. Tensors created by
+        // create_tensor() with no params are device-local (BT_BUF_INTERNAL) RemoteTensors and
+        // therefore hit the no-copy swap path.
+        ov::RemoteContext device_ctx;
+        if(device_output) {
+            device_ctx = compiled_model.get_context();
+        }
+#endif
         for(size_t i = 0; i < rwb.outputs.size(); ++i) {
             auto target_shape = request.get_compiled_model().output(i).get_partial_shape();
             auto& output_tensor = outputs[rwb.outputs[i]];
+#ifdef LORA_USE_REMOTE_TENSOR
+            if(device_output && target_shape.is_static()) {
+                auto dev_tensor = device_ctx.create_tensor(
+                    request.get_compiled_model().output(i).get_element_type(),
+                    target_shape.get_shape());
+                outputs[rwb.outputs[i]] = dev_tensor;       // hand the device tensor back to the caller
+                request.set_output_tensor(i, dev_tensor);   // and bind it as the request output
+                continue;
+            }
+#endif
             if(target_shape != output_tensor.get_shape() && target_shape.is_static()) {
                 // do it for static case only, because if target shape is dynamic, the plugin is allowed to set shape on its own
                 output_tensor.set_shape(target_shape.get_shape());
@@ -817,9 +870,36 @@ public:
             request.set_output_tensor(i, output_tensor);
         }
         for(auto bypass: rwb.bypass) {
+#ifdef LORA_USE_REMOTE_TENSOR
+            if(device_output) {
+                // A bypass is a Parameter->Result pair (single adapter, no concat needed): the
+                // input tensor is forwarded straight to the output. That input is the original
+                // LoRA weight, a HOST tensor, so forwarding it verbatim would send set_state back
+                // to the host->device copy path and defeat the whole optimization. Upload it into
+                // a device tensor here instead.
+                const auto& src = inputs[bypass.first];
+                auto dev_tensor = device_ctx.create_tensor(src.get_element_type(), src.get_shape());
+                src.copy_to(dev_tensor);
+                outputs[bypass.second] = dev_tensor;
+                continue;
+            }
+#endif
             outputs[bypass.second] = inputs[bypass.first];
         }
         request.infer();    // TODO: Consider using async to increase throughput, requires more complicated archestration
+
+#ifdef LORA_USE_REMOTE_TENSOR
+        // One-shot report of which LoRA evaluator path is active (set OV_LORA_DIAG=1).
+        static bool diag_once = false;
+        if(!diag_once && std::getenv("OV_LORA_DIAG")) {
+            diag_once = true;
+            std::cerr << "[LORA-DIAG][EVAL] evaluator_device=\"" << device << "\""
+                      << "  on_device=" << (on_device() ? 1 : 0)
+                      << "  outputs=" << outputs.size()
+                      << "  bypass=" << rwb.bypass.size()
+                      << std::endl;
+        }
+#endif
     }
 
 private:
@@ -1310,10 +1390,43 @@ struct AdapterControllerImpl {
     // Needed to track which LoRA tensors were actually applied to suppress unused tensor warnings
     std::shared_ptr<LoRAWeightGetterDefault<NodePtr, NodePtr>> const_getter_impl;
 
-    AdapterControllerImpl(std::shared_ptr<ov::Model> model, const AdapterConfig& config) :
+#ifdef LORA_USE_REMOTE_TENSOR
+    // CVS-187607: pick the device for the LoRA state concat evaluator.
+    // Default keeps the legacy "CPU" path, so the no-copy path is strictly opt-in:
+    //   OV_LORA_EVALUATOR_DEVICE=GPU     -> run concat on GPU and keep output in device memory
+    //   OV_LORA_EVALUATOR_DEVICE=INFER   -> follow the inference device
+    //   OV_LORA_EVALUATOR_DEVICE=<dev>   -> use <dev> verbatim
+    // Unset -> "CPU" regardless of the inference device (original behaviour).
+    static std::string lora_evaluator_device(const std::string& infer_device) {
+        if (const char* e = std::getenv("OV_LORA_EVALUATOR_DEVICE")) {
+            if (e[0] != '\0') {
+                std::string v(e);
+                if (v == "INFER" || v == "infer") {
+                    return infer_device;
+                }
+                return v;
+            }
+        }
+        return "CPU";
+    }
+#endif
+
+    AdapterControllerImpl(std::shared_ptr<ov::Model> model, const AdapterConfig& config, const std::string& device = "CPU") :
         current_config(config),  // FIXME: Compare current and passed configs and change incrementally
+#ifdef LORA_USE_REMOTE_TENSOR
+        // CVS-187607: when opted in, the concat evaluator runs on the inference device AND keeps
+        // its output in device memory (see evaluate()/on_device()), so the result reaches
+        // VariableState::set_state as a RemoteTensor and is adopted by a no-copy swap.
+        lora_state_evaluators(lora_evaluator_device(device))
+#else
+        // Original path: the concat evaluator always runs on CPU, so set_state performs a
+        // host->device copy. (device is unused here.)
         lora_state_evaluators("CPU")    // FIXME: Try to run on the same device that is used for model inference
+#endif
     {
+#ifndef LORA_USE_REMOTE_TENSOR
+        (void)device;  // unused when the RemoteTensor path is compiled out
+#endif
         LoRAConstantGetter const_getter;
         LoRAParametersByWeightGetter params_getter;
         params_getter.type = ov::element::dynamic;
@@ -1836,6 +1949,12 @@ struct AdapterControllerImpl {
 
 AdapterController::AdapterController(std::shared_ptr<ov::Model> model, const AdapterConfig& config, std::string device)
 {
+    // Keep the full device specifier (e.g. "GPU.1"). The mode lookup below collapses device
+    // variants to a bare "GPU", but the LoRA state evaluator must compile on the SAME device
+    // as inference: a tensor allocated on GPU.0 cannot back a state used by a model running
+    // on GPU.1 (different cldnn::engine -> "onednn engine was not initialized" at infer time).
+    const std::string infer_device = device;
+
     // If AdapterConfig::MODE_AUTO is used, then set real mode depending on the device capabilities
     // TODO: Remove this code when devices become aligned on their capabilities for LoRA adapters
     if (config.get_mode() == AdapterConfig::MODE_AUTO) {
@@ -1851,7 +1970,7 @@ AdapterController::AdapterController(std::shared_ptr<ov::Model> model, const Ada
         if(default_mode != default_modes.end()) {
             AdapterConfig updated_config = config;
             updated_config.set_mode(default_mode->second);
-            m_pimpl = std::make_shared<AdapterControllerImpl>(model, updated_config);
+            m_pimpl = std::make_shared<AdapterControllerImpl>(model, updated_config, infer_device);
             return;
         } else {
             std::string device_msg;
@@ -1866,7 +1985,7 @@ AdapterController::AdapterController(std::shared_ptr<ov::Model> model, const Ada
                 << "To avoid this warning set one of the AdapterConfig::Mode values except MODE_AUTO.";
         }
     }
-    m_pimpl = std::make_shared<AdapterControllerImpl>(model, config);
+    m_pimpl = std::make_shared<AdapterControllerImpl>(model, config, device);
 }
 
 
