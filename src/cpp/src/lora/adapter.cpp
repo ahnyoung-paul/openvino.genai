@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <set>
 #include <map>
 #include <string>
@@ -38,6 +40,7 @@
 #include "openvino/pass/manager.hpp"
 
 #include "openvino/genai/lora_adapter.hpp"
+#include "openvino/genai/perf_metrics.hpp"
 
 #include "utils.hpp"
 #include "lora/common.hpp"
@@ -1280,6 +1283,22 @@ bool operator== (const Adapter& a, const Adapter& b) {
 
 
 struct AdapterControllerImpl {
+    struct ApplyProfile {
+        float prepare_weight_getters_us = 0.0f;
+        float query_state_us = 0.0f;
+        float set_lora_tensors_us = 0.0f;
+        // Sub-split of set_lora_tensors accumulated across the per-layer loop:
+        //   prepare_tensors_us -> GenAI/CPU concat evaluator (prepare_lora_tensors)
+        //   set_state_us        -> GPU plugin state upload (VariableState::set_state)
+        float prepare_tensors_us = 0.0f;
+        float set_state_us = 0.0f;
+        // Cross-check: sum of wall-clock around each set_lora_tensors() CALL SITE in the loop.
+        // Should satisfy: set_lora_tensors_call_us ≈ set_lora_tensors_us (t3-t2)
+        //             and set_lora_tensors_call_us ≈ prepare_tensors_us + set_state_us
+        float set_lora_tensors_call_us = 0.0f;
+        float set_constants_us = 0.0f;
+    };
+    ApplyProfile last_apply_profile;
     LoRAVarMap variable_ids;
     std::map<std::string, ov::op::util::VariableInfo> constant_variable_ids;
     std::unordered_set<std::string> variable_names;
@@ -1430,6 +1449,7 @@ struct AdapterControllerImpl {
 
     void apply (ov::InferRequest& infer_request, std::optional<AdapterConfig> config) {
         // FIXME: If a part of LoRA state tensors are not set here, then need to carefully reset state in LLMPipeline where global reset is called after the generation
+        last_apply_profile = {};  // Reset profile so stale data isn't reported when no real switch occurs
         ConfigChanged diff;
         if(config) {
             diff = compare_configs(current_config, *config);
@@ -1465,9 +1485,12 @@ struct AdapterControllerImpl {
         if (current_config.get_mode() != AdapterConfig::MODE_AUTO && 
             current_config.get_mode() != AdapterConfig::MODE_DYNAMIC &&
             current_config.get_mode() != AdapterConfig::MODE_STATIC_RANK ) {
+            last_apply_profile = {};
             return;
         }
 
+        // Phase 1: prepare weight getters
+        auto t0 = std::chrono::steady_clock::now();
         std::vector<LoRAWeightGetter> weight_getters;
         LoRAConstantGetter const_getter;
         const auto& adapters = current_config.get_adapters();
@@ -1486,6 +1509,9 @@ struct AdapterControllerImpl {
                                                               current_config.get_tensor_name_prefix().value_or("")));
         }
 
+        auto t1 = std::chrono::steady_clock::now();
+
+        // Phase 2: query_state + build index map
         auto state = infer_request.query_state();
         // TODO: Forced to use variable_id instead of index to address the state tensors, require the same order for state as for variables from plugins
 
@@ -1497,15 +1523,24 @@ struct AdapterControllerImpl {
             state_name_to_index[name] = i;
         }
 
+        auto t2 = std::chrono::steady_clock::now();
+
+        // Phase 3: set_lora_tensors loop
         for(const auto& lora_var_ids : variable_ids) {
             // FIXME: Remove this mapping when the order of state will be the same as the order of variables
             LoRAIndices lora_indices;
             lora_indices.alpha = state_name_to_index.at(lora_var_ids.second.alpha.variable_id);
             lora_indices.A = state_name_to_index.at(lora_var_ids.second.A.variable_id);
             lora_indices.B = state_name_to_index.at(lora_var_ids.second.B.variable_id);
+            // Cross-check timing measured at the CALL SITE (independent of the in-function brackets)
+            auto call_start = std::chrono::steady_clock::now();
             set_lora_tensors(state, lora_var_ids.first, lora_var_ids.second, lora_indices, weight_getters, alpha_only);
+            auto call_end = std::chrono::steady_clock::now();
+            last_apply_profile.set_lora_tensors_call_us += PerfMetrics::get_microsec(call_end - call_start);
         }
+        auto t3 = std::chrono::steady_clock::now();
 
+        // Phase 4: set constants
         for (const auto& [const_name, var_info] : constant_variable_ids) {
 
             size_t const_lora_index = state_name_to_index.at(var_info.variable_id);
@@ -1530,7 +1565,25 @@ struct AdapterControllerImpl {
                 state[const_lora_index].set_state(const_tensor);
             }
         }
+        auto t4 = std::chrono::steady_clock::now();
 
+        // Record profiling
+        last_apply_profile.prepare_weight_getters_us = PerfMetrics::get_microsec(t1 - t0);
+        last_apply_profile.query_state_us = PerfMetrics::get_microsec(t2 - t1);
+        last_apply_profile.set_lora_tensors_us = PerfMetrics::get_microsec(t3 - t2);
+        last_apply_profile.set_constants_us = PerfMetrics::get_microsec(t4 - t3);
+
+        // [DIAG] Identity cross-check. Should hold:
+        //   loop(t3-t2) ≈ call_site_sum ≈ prepare_tensors + set_state
+        if (last_apply_profile.set_lora_tensors_us > 1000.0f) {  // only for real switches
+            std::cerr << "[LORA-DIAG] iters=" << variable_ids.size()
+                      << "  loop(t3-t2)=" << last_apply_profile.set_lora_tensors_us / 1000.0f << "ms"
+                      << "  call_site_sum=" << last_apply_profile.set_lora_tensors_call_us / 1000.0f << "ms"
+                      << "  prepare_tensors=" << last_apply_profile.prepare_tensors_us / 1000.0f << "ms"
+                      << "  set_state=" << last_apply_profile.set_state_us / 1000.0f << "ms"
+                      << "  (pt+ss=" << (last_apply_profile.prepare_tensors_us + last_apply_profile.set_state_us) / 1000.0f << "ms)"
+                      << std::endl;
+        }
     }
 
     std::vector<LoRAWeight> collect_applicable_tensors (const std::string& lora_name, const std::vector<LoRAWeightGetter>& weight_getters) {
@@ -1727,17 +1780,39 @@ struct AdapterControllerImpl {
         const std::vector<LoRAWeightGetter>& weight_getters,
         bool alpha_only
     ) {
+        // Sub-phase (a): GenAI/CPU work = LoRAParts allocation + concat of LoRA A/B/alpha tensors.
+        // ta starts at the very top so the whole function body is partitioned with no untimed gap:
+        //   t3 - t2 (loop) == Σ prepare_tensors_us + Σ set_state_us  (should hold as an identity)
+        auto ta = std::chrono::steady_clock::now();
         LoRAParts<ov::Tensor> lora_state_tensors{
             ov::Tensor(lora_var_ids.alpha.data_type, dynamic_to_static(lora_var_ids.alpha.data_shape)),
             alpha_only ? ov::Tensor() : ov::Tensor(lora_var_ids.A.data_type, dynamic_to_static(lora_var_ids.A.data_shape)),
             alpha_only ? ov::Tensor() : ov::Tensor(lora_var_ids.B.data_type, dynamic_to_static(lora_var_ids.B.data_shape))
         };
         auto new_tensors = prepare_lora_tensors(name, weight_getters, lora_state_tensors, /*set_empty_adapters=*/true, alpha_only);
+        auto tb = std::chrono::steady_clock::now();
+
+        // Sub-phase (b): GPU plugin state upload (VariableState::set_state).
+        // NOTE: this brackets only the host-side enqueue; the actual GPU copy may complete
+        // asynchronously and thus may NOT be attributed here.
         state[lora_indices.alpha].set_state(new_tensors.alpha);
         if(!alpha_only) {
             state[lora_indices.A].set_state(new_tensors.A);
             state[lora_indices.B].set_state(new_tensors.B);
         }
+        auto tc = std::chrono::steady_clock::now();
+
+        // Accumulate across the per-layer loop (reset happens in apply())
+        float prepare_tensors_us = PerfMetrics::get_microsec(tb - ta);
+        float set_state_us = PerfMetrics::get_microsec(tc - tb);
+        if (std::getenv("OV_LORA_DIAG")) {
+            std::cout << "[LORA-DIAG] " << name
+                      << "  prepare_tensors=" << prepare_tensors_us / 1000.0f << "ms"
+                      << "  set_state=" << set_state_us / 1000.0f << "ms"
+                      << std::endl;
+        }
+        last_apply_profile.prepare_tensors_us += prepare_tensors_us;
+        last_apply_profile.set_state_us       += set_state_us;
     }
 
     LoRAParts<ov::Tensor> prepare_lora_tensors (
@@ -1907,6 +1982,15 @@ void AdapterConfig::set_adapters_and_alphas(const std::vector<std::pair<Adapter,
         adapters.push_back(adapter_and_alpha.first);
         alphas.push_back(adapter_and_alpha.second);
     }
+}
+
+AdapterController::ApplyProfile AdapterController::get_last_apply_profile() const {
+    if (m_pimpl) {
+        auto& p = m_pimpl->last_apply_profile;
+        return {p.prepare_weight_getters_us, p.query_state_us, p.set_lora_tensors_us,
+                p.prepare_tensors_us, p.set_state_us, p.set_constants_us};
+    }
+    return {};
 }
 
 

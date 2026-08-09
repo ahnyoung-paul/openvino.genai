@@ -257,7 +257,29 @@ void init_vlm_pipeline(py::module_& m) {
         .def_property_readonly("prepare_embeddings_durations", [](const ov::genai::VLMRawPerfMetrics& rw) {
             return common_utils::get_ms(rw, &ov::genai::VLMRawPerfMetrics::prepare_embeddings_durations);
         })
-        .def_readonly("per_image_slice_counts", &ov::genai::VLMRawPerfMetrics::per_image_slice_counts);
+        .def_readonly("per_image_slice_counts", &ov::genai::VLMRawPerfMetrics::per_image_slice_counts)
+        .def_property_readonly("adapter_switch_durations", [](const ov::genai::VLMRawPerfMetrics& rw) {
+            return common_utils::get_ms(rw, &ov::genai::VLMRawPerfMetrics::adapter_switch_durations);
+        })
+        // adapter apply sub-phases (in ms)
+        .def_property_readonly("adapter_prepare_weight_getters_durations", [](const ov::genai::VLMRawPerfMetrics& rw) {
+            return common_utils::get_ms(rw, &ov::genai::VLMRawPerfMetrics::adapter_prepare_weight_getters_durations);
+        })
+        .def_property_readonly("adapter_query_state_durations", [](const ov::genai::VLMRawPerfMetrics& rw) {
+            return common_utils::get_ms(rw, &ov::genai::VLMRawPerfMetrics::adapter_query_state_durations);
+        })
+        .def_property_readonly("adapter_set_lora_tensors_durations", [](const ov::genai::VLMRawPerfMetrics& rw) {
+            return common_utils::get_ms(rw, &ov::genai::VLMRawPerfMetrics::adapter_set_lora_tensors_durations);
+        })
+        .def_property_readonly("adapter_prepare_tensors_durations", [](const ov::genai::VLMRawPerfMetrics& rw) {
+            return common_utils::get_ms(rw, &ov::genai::VLMRawPerfMetrics::adapter_prepare_tensors_durations);
+        })
+        .def_property_readonly("adapter_set_state_durations", [](const ov::genai::VLMRawPerfMetrics& rw) {
+            return common_utils::get_ms(rw, &ov::genai::VLMRawPerfMetrics::adapter_set_state_durations);
+        })
+        .def_property_readonly("adapter_set_constants_durations", [](const ov::genai::VLMRawPerfMetrics& rw) {
+            return common_utils::get_ms(rw, &ov::genai::VLMRawPerfMetrics::adapter_set_constants_durations);
+        });
 
     py::class_<ov::genai::VLMPerfMetrics, ov::genai::PerfMetrics>(m, "VLMPerfMetrics", perf_metrics_docstring)
         .def(py::init<>())
@@ -265,6 +287,13 @@ void init_vlm_pipeline(py::module_& m) {
         .def("get_total_image_slice_count", &ov::genai::VLMPerfMetrics::get_total_image_slice_count,
              R"(Returns the total number of image slices processed for the request.
 An input image without explicit slicing metadata counts as one slice.)")
+        .def("get_adapter_switch_duration", &ov::genai::VLMPerfMetrics::get_adapter_switch_duration)
+        .def("get_adapter_prepare_weight_getters_duration", &ov::genai::VLMPerfMetrics::get_adapter_prepare_weight_getters_duration)
+        .def("get_adapter_query_state_duration", &ov::genai::VLMPerfMetrics::get_adapter_query_state_duration)
+        .def("get_adapter_set_lora_tensors_duration", &ov::genai::VLMPerfMetrics::get_adapter_set_lora_tensors_duration)
+        .def("get_adapter_prepare_tensors_duration", &ov::genai::VLMPerfMetrics::get_adapter_prepare_tensors_duration)
+        .def("get_adapter_set_state_duration", &ov::genai::VLMPerfMetrics::get_adapter_set_state_duration)
+        .def("get_adapter_set_constants_duration", &ov::genai::VLMPerfMetrics::get_adapter_set_constants_duration)
         .def_readonly("vlm_raw_metrics", &ov::genai::VLMPerfMetrics::vlm_raw_metrics);
 
     py::class_<ov::genai::VLMDecodedResults, ov::genai::DecodedResults>(m, "VLMDecodedResults", decoded_results_docstring)

@@ -4,6 +4,7 @@
 #pragma once
 
 #include "openvino/genai/continuous_batching_pipeline.hpp"
+#include "openvino/genai/lora_adapter.hpp"
 #include "visual_language/inputs_embedder.hpp"
 #include "visual_language/vision_registry.hpp"
 
@@ -64,6 +65,8 @@ protected:
     // to access m_load_time_ms
     friend class ContinuousBatchingPipeline;
 
+    MicroSeconds m_last_adapter_switch_duration{0.0f};
+    AdapterController::ApplyProfile m_last_apply_profile;
     ModelInputType m_model_input_type = ModelInputType::TOKENS;
     std::shared_ptr<InputsEmbedder> m_inputs_embedder;
     std::mutex m_embeddings_mutex;
