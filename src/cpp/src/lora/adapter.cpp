@@ -749,7 +749,9 @@ class InferRequestSignatureCache {
 public:
     using Signature = std::string;
 
-    InferRequestSignatureCache (const std::string& device) : device(device) {}
+    InferRequestSignatureCache(const std::string& device, const std::string& infer_device = {}) :
+        device(device),
+        infer_device(infer_device.empty() ? device : infer_device) {}
 
     bool exist (const Signature& signature) {
         return requests.count(signature);
@@ -825,9 +827,13 @@ public:
         static bool diag_once = false;
         if(!diag_once && std::getenv("OV_LORA_DIAG")) {
             diag_once = true;
-            const bool on_device = !device.empty() && device.find("CPU") == std::string::npos;
+            const bool evaluator_on_gpu = device.find("GPU") != std::string::npos;
+            const auto output_type =
+                outputs.empty() ? ov::element::dynamic : outputs.front().get_element_type();
             std::cerr << "[LORA-DIAG][EVAL] evaluator_device=" << static_cast<char>(34) << device << static_cast<char>(34)
-                      << "  on_device=" << (on_device ? 1 : 0)
+                      << "  infer_device=" << static_cast<char>(34) << infer_device << static_cast<char>(34)
+                      << "  evaluator_on_gpu=" << (evaluator_on_gpu ? 1 : 0)
+                      << "  output_type=" << output_type
                       << "  outputs=" << outputs.size()
                       << "  bypass=" << rwb.bypass.size()
                       << std::endl;
@@ -842,6 +848,7 @@ private:
 
     std::unordered_map<Signature, RequestWithBypass> requests;
     std::string device;
+    std::string infer_device;
 };
 
 
@@ -1316,15 +1323,32 @@ struct AdapterControllerImpl {
     std::unordered_set<std::string> variable_names;
     AdapterConfig current_config;
     bool need_full_apply = true;
+    bool convert_lora_state_to_f16 = false;
     InferRequestSignatureCache lora_state_evaluators;
 
     // Stores the actual LoRA weight getter used for Constant tensor replacement
     // Needed to track which LoRA tensors were actually applied to suppress unused tensor warnings
     std::shared_ptr<LoRAWeightGetterDefault<NodePtr, NodePtr>> const_getter_impl;
 
-    AdapterControllerImpl(std::shared_ptr<ov::Model> model, const AdapterConfig& config) :
+    static std::string lora_evaluator_device(const std::string& infer_device) {
+        if (const char* env = std::getenv("OV_LORA_EVALUATOR_DEVICE")) {
+            if (env[0] != '\0') {
+                std::string requested_device(env);
+                if (requested_device == "INFER" || requested_device == "infer") {
+                    return infer_device;
+                }
+                return requested_device;
+            }
+        }
+        return "CPU";
+    }
+
+    AdapterControllerImpl(std::shared_ptr<ov::Model> model,
+                          const AdapterConfig& config,
+                          const std::string& device = "CPU") :
         current_config(config),  // FIXME: Compare current and passed configs and change incrementally
-        lora_state_evaluators("CPU")    // FIXME: Try to run on the same device that is used for model inference
+        convert_lora_state_to_f16(device.find("GPU") != std::string::npos),
+        lora_state_evaluators(lora_evaluator_device(device), device)
     {
         LoRAConstantGetter const_getter;
         LoRAParametersByWeightGetter params_getter;
@@ -1697,10 +1721,20 @@ struct AdapterControllerImpl {
     ) {
         ov::OutputVector concat_inputs;
         concat_inputs.reserve(inputs.size());
+        const auto output_type = output.get_element_type();
+        const bool convert_after_concat =
+            convert_lora_state_to_f16 && output_type == ov::element::f16;
+        ov::element::Type concat_type = ov::element::dynamic;
         for(size_t i = 0; i < inputs.size(); ++i) {
             NodePtr input = parameters[(alpha_only ? 1 : 3)*i + offset] = input_accessor(inputs[i]);
-            if(input->get_output_element_type(0) != output.get_element_type()) {
-                input = std::make_shared<v0::Convert>(input, output.get_element_type());
+            if(convert_after_concat) {
+                if(concat_type == ov::element::dynamic) {
+                    concat_type = input->get_output_element_type(0);
+                } else if(input->get_output_element_type(0) != concat_type) {
+                    input = std::make_shared<v0::Convert>(input, concat_type);
+                }
+            } else if(input->get_output_element_type(0) != output_type) {
+                input = std::make_shared<v0::Convert>(input, output_type);
             }
             if(input->get_output_partial_shape(0).rank().get_length() > 2) {
                 input = squeeze_2d(input);
@@ -1714,6 +1748,9 @@ struct AdapterControllerImpl {
             result = std::make_shared<v0::Concat>(concat_inputs, concat_axis);
         } else {
             result = concat_inputs.front().get_node_shared_ptr();
+        }
+        if(convert_after_concat && result->get_output_element_type(0) != output_type) {
+            result = std::make_shared<v0::Convert>(result, output_type);
         }
 
         results[offset] = std::make_shared<v0::Result>(result);
@@ -1796,10 +1833,18 @@ struct AdapterControllerImpl {
         // ta starts at the very top so the whole function body is partitioned with no untimed gap:
         //   t3 - t2 (loop) == Σ prepare_tensors_us + Σ set_state_us  (should hold as an identity)
         auto ta = std::chrono::steady_clock::now();
+        const auto state_output_type = [this](const ov::element::Type& state_type) {
+            return convert_lora_state_to_f16 ? ov::element::f16 : state_type;
+        };
         LoRAParts<ov::Tensor> lora_state_tensors{
-            ov::Tensor(lora_var_ids.alpha.data_type, dynamic_to_static(lora_var_ids.alpha.data_shape)),
-            alpha_only ? ov::Tensor() : ov::Tensor(lora_var_ids.A.data_type, dynamic_to_static(lora_var_ids.A.data_shape)),
-            alpha_only ? ov::Tensor() : ov::Tensor(lora_var_ids.B.data_type, dynamic_to_static(lora_var_ids.B.data_shape))
+            ov::Tensor(state_output_type(lora_var_ids.alpha.data_type),
+                       dynamic_to_static(lora_var_ids.alpha.data_shape)),
+            alpha_only ? ov::Tensor()
+                       : ov::Tensor(state_output_type(lora_var_ids.A.data_type),
+                                    dynamic_to_static(lora_var_ids.A.data_shape)),
+            alpha_only ? ov::Tensor()
+                       : ov::Tensor(state_output_type(lora_var_ids.B.data_type),
+                                    dynamic_to_static(lora_var_ids.B.data_shape))
         };
         auto new_tensors = prepare_lora_tensors(name, weight_getters, lora_state_tensors, /*set_empty_adapters=*/true, alpha_only);
         auto tb = std::chrono::steady_clock::now();
@@ -1848,6 +1893,8 @@ struct AdapterControllerImpl {
 
 AdapterController::AdapterController(std::shared_ptr<ov::Model> model, const AdapterConfig& config, std::string device)
 {
+    const std::string infer_device = device;
+
     // If AdapterConfig::MODE_AUTO is used, then set real mode depending on the device capabilities
     // TODO: Remove this code when devices become aligned on their capabilities for LoRA adapters
     if (config.get_mode() == AdapterConfig::MODE_AUTO) {
@@ -1863,7 +1910,7 @@ AdapterController::AdapterController(std::shared_ptr<ov::Model> model, const Ada
         if(default_mode != default_modes.end()) {
             AdapterConfig updated_config = config;
             updated_config.set_mode(default_mode->second);
-            m_pimpl = std::make_shared<AdapterControllerImpl>(model, updated_config);
+            m_pimpl = std::make_shared<AdapterControllerImpl>(model, updated_config, infer_device);
             return;
         } else {
             std::string device_msg;
@@ -1878,7 +1925,7 @@ AdapterController::AdapterController(std::shared_ptr<ov::Model> model, const Ada
                 << "To avoid this warning set one of the AdapterConfig::Mode values except MODE_AUTO.";
         }
     }
-    m_pimpl = std::make_shared<AdapterControllerImpl>(model, config);
+    m_pimpl = std::make_shared<AdapterControllerImpl>(model, config, infer_device);
 }
 
 
