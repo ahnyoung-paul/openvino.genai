@@ -39,6 +39,7 @@
 #include "openvino/pass/pattern/op/wrap_type.hpp"
 #include "openvino/pass/graph_rewrite.hpp"
 #include "openvino/pass/manager.hpp"
+#include "openvino/runtime/properties.hpp"
 
 #include "openvino/genai/lora_adapter.hpp"
 #include "openvino/genai/perf_metrics.hpp"
@@ -758,6 +759,10 @@ public:
         return requests.count(signature);
     }
 
+    void clear() {
+        requests.clear();
+    }
+
     void insert (const Signature& signature, ov::ResultVector& results, ov::ParameterVector& parameters) {
         // Detect Parameter -> Result patterns and do not allow them to be included into compiled model to avoid unnecessary overheads, and handle them via a bypass.
         // Assume that each parameter from parameters vector do not have other consumers outside model formed by parameters -> ... -> results.
@@ -1324,7 +1329,9 @@ struct AdapterControllerImpl {
     std::unordered_set<std::string> variable_names;
     AdapterConfig current_config;
     bool need_full_apply = true;
-    bool convert_lora_state_to_f16 = false;
+    bool infer_device_is_gpu = false;
+    bool output_type_initialized = false;
+    std::optional<ov::element::Type> state_output_type_override;
     InferRequestSignatureCache lora_state_evaluators;
 
     struct PreparedTensorCacheEntry {
@@ -1361,7 +1368,7 @@ struct AdapterControllerImpl {
                           const AdapterConfig& config,
                           const std::string& device = "CPU") :
         current_config(config),  // FIXME: Compare current and passed configs and change incrementally
-        convert_lora_state_to_f16(device.find("GPU") != std::string::npos),
+        infer_device_is_gpu(device.find("GPU") != std::string::npos),
         lora_state_evaluators(lora_evaluator_device(device), device)
     {
         LoRAConstantGetter const_getter;
@@ -1461,8 +1468,6 @@ struct AdapterControllerImpl {
         for(const auto& var: constant_variable_ids) {
             variable_names.insert(var.second.variable_id);
         }
-
-        prepare_initial_configs();
     }
 
     static std::shared_ptr<AdapterImpl> get_adapter_impl(const Adapter& adapter) {
@@ -1517,6 +1522,7 @@ struct AdapterControllerImpl {
                 "Cannot change adapters and/or the alphas when not one of the dynamic modes are used.");
             current_config = std::move(updated_config);
         }
+        prepare(infer_request);
         if(need_full_apply) {
             need_full_apply = false;
             set_new_adapter_tensors(infer_request);
@@ -1543,17 +1549,56 @@ struct AdapterControllerImpl {
                lhs.get_adapters_and_alphas() == rhs.get_adapters_and_alphas();
     }
 
-    ov::element::Type state_output_type(const ov::element::Type& state_type) const {
-        return convert_lora_state_to_f16 ? ov::element::f16 : state_type;
+    void prepare(ov::InferRequest& infer_request) {
+        std::optional<ov::element::Type> new_output_type;
+        const auto compiled_model = infer_request.get_compiled_model();
+        ov::element::Type inference_precision = ov::element::dynamic;
+        if (infer_device_is_gpu) {
+            inference_precision = compiled_model.get_property(ov::hint::inference_precision);
+            OPENVINO_ASSERT(inference_precision == ov::element::f16 ||
+                                inference_precision == ov::element::f32 ||
+                                inference_precision == ov::element::dynamic,
+                            "Unsupported GPU inference precision hint for LoRA state preparation: ",
+                            inference_precision);
+            if (inference_precision == ov::element::f16) {
+                new_output_type = ov::element::f16;
+            }
+        }
+
+        if (output_type_initialized && state_output_type_override == new_output_type) {
+            return;
+        }
+
+        state_output_type_override = new_output_type;
+        output_type_initialized = true;
+        prepared_tensor_cache.clear();
+        prepared_tensor_cache_byte_size = 0;
+        lora_state_evaluators.clear();
+
+        if (std::getenv("OV_LORA_DIAG")) {
+            std::cout << "[LORA-DIAG][TYPE] inference_precision_hint="
+                      << inference_precision.get_type_name()
+                      << "  selected_output_type="
+                      << (state_output_type_override ? state_output_type_override->get_type_name() : "declared-state-type")
+                      << std::endl;
+        }
+
+        prepare_initial_configs();
+    }
+
+    ov::element::Type state_output_type(const ov::op::util::VariableInfo& variable_info) const {
+        OPENVINO_ASSERT(output_type_initialized,
+                        "LoRA output type must be prepared after model compilation");
+        return state_output_type_override.value_or(variable_info.data_type);
     }
 
     LoRAParts<ov::Tensor> allocate_lora_state_tensors(const LoRAVarIDs& lora_var_ids) const {
         return {
-            ov::Tensor(state_output_type(lora_var_ids.alpha.data_type),
+            ov::Tensor(state_output_type(lora_var_ids.alpha),
                        dynamic_to_static(lora_var_ids.alpha.data_shape)),
-            ov::Tensor(state_output_type(lora_var_ids.A.data_type),
+            ov::Tensor(state_output_type(lora_var_ids.A),
                        dynamic_to_static(lora_var_ids.A.data_shape)),
-            ov::Tensor(state_output_type(lora_var_ids.B.data_type),
+            ov::Tensor(state_output_type(lora_var_ids.B),
                        dynamic_to_static(lora_var_ids.B.data_shape))
         };
     }
@@ -1572,9 +1617,10 @@ struct AdapterControllerImpl {
     }
 
     void validate_prepared_tensor(const ov::Tensor& tensor,
-                                  const ov::op::util::VariableInfo& variable_info) const {
+                                  const ov::op::util::VariableInfo& variable_info,
+                                  const ov::element::Type& expected_type) const {
         OPENVINO_ASSERT(tensor);
-        OPENVINO_ASSERT(tensor.get_element_type() == state_output_type(variable_info.data_type));
+        OPENVINO_ASSERT(tensor.get_element_type() == expected_type);
         OPENVINO_ASSERT(variable_info.data_shape.compatible(ov::PartialShape(tensor.get_shape())));
     }
 
@@ -1591,9 +1637,15 @@ struct AdapterControllerImpl {
                                                 /*set_empty_adapters=*/true,
                                                 /*alpha_only=*/false,
                                                 config);
-            validate_prepared_tensor(tensors.alpha, lora_var_ids.second.alpha);
-            validate_prepared_tensor(tensors.A, lora_var_ids.second.A);
-            validate_prepared_tensor(tensors.B, lora_var_ids.second.B);
+            validate_prepared_tensor(tensors.alpha,
+                                     lora_var_ids.second.alpha,
+                                     state_output_type(lora_var_ids.second.alpha));
+            validate_prepared_tensor(tensors.A,
+                                     lora_var_ids.second.A,
+                                     state_output_type(lora_var_ids.second.A));
+            validate_prepared_tensor(tensors.B,
+                                     lora_var_ids.second.B,
+                                     state_output_type(lora_var_ids.second.B));
             prepared_tensors.push_back(std::move(tensors));
         }
         return prepared_tensors;
@@ -1883,19 +1935,13 @@ struct AdapterControllerImpl {
         ov::OutputVector concat_inputs;
         concat_inputs.reserve(inputs.size());
         const auto output_type = output.get_element_type();
-        const bool convert_after_concat =
-            convert_lora_state_to_f16 && output_type == ov::element::f16;
         ov::element::Type concat_type = ov::element::dynamic;
         for(size_t i = 0; i < inputs.size(); ++i) {
             NodePtr input = parameters[(alpha_only ? 1 : 3)*i + offset] = input_accessor(inputs[i]);
-            if(convert_after_concat) {
-                if(concat_type == ov::element::dynamic) {
-                    concat_type = input->get_output_element_type(0);
-                } else if(input->get_output_element_type(0) != concat_type) {
-                    input = std::make_shared<v0::Convert>(input, concat_type);
-                }
-            } else if(input->get_output_element_type(0) != output_type) {
-                input = std::make_shared<v0::Convert>(input, output_type);
+            if(concat_type == ov::element::dynamic) {
+                concat_type = input->get_output_element_type(0);
+            } else if(input->get_output_element_type(0) != concat_type) {
+                input = std::make_shared<v0::Convert>(input, concat_type);
             }
             if(input->get_output_partial_shape(0).rank().get_length() > 2) {
                 input = squeeze_2d(input);
@@ -1910,7 +1956,7 @@ struct AdapterControllerImpl {
         } else {
             result = concat_inputs.front().get_node_shared_ptr();
         }
-        if(convert_after_concat && result->get_output_element_type(0) != output_type) {
+        if(result->get_output_element_type(0) != output_type) {
             result = std::make_shared<v0::Convert>(result, output_type);
         }
 
@@ -2072,6 +2118,11 @@ AdapterController::AdapterController(std::shared_ptr<ov::Model> model, const Ada
     m_pimpl = std::make_shared<AdapterControllerImpl>(model, config, infer_device);
 }
 
+void AdapterController::prepare(ov::InferRequest request) {
+    if (m_pimpl) {
+        m_pimpl->prepare(request);
+    }
+}
 
 // Call it every time when adapter config is changed; if adapter was configured as a static one, this call is not required
 void AdapterController::apply(ov::InferRequest request, const std::optional<AdapterConfig>& config) {
