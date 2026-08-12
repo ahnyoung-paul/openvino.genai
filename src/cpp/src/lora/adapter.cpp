@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <functional>
+#include <list>
 #include <memory>
 #include <cmath>
 
@@ -1307,13 +1308,13 @@ struct AdapterControllerImpl {
         float query_state_us = 0.0f;
         float set_lora_tensors_us = 0.0f;
         // Sub-split of set_lora_tensors accumulated across the per-layer loop:
-        //   prepare_tensors_us -> GenAI/CPU concat evaluator (prepare_lora_tensors)
+        //   prepare_tensors_us -> prepared-output cache lookup/fill (prepare_lora_tensors on miss)
         //   set_state_us        -> GPU plugin state upload (VariableState::set_state)
         float prepare_tensors_us = 0.0f;
         float set_state_us = 0.0f;
         // Cross-check: sum of wall-clock around each set_lora_tensors() CALL SITE in the loop.
         // Should satisfy: set_lora_tensors_call_us ≈ set_lora_tensors_us (t3-t2)
-        //             and set_lora_tensors_call_us ≈ prepare_tensors_us + set_state_us
+        //             and set_lora_tensors_call_us ≈ cache lookup/fill + set_state_us
         float set_lora_tensors_call_us = 0.0f;
         float set_constants_us = 0.0f;
     };
@@ -1325,6 +1326,19 @@ struct AdapterControllerImpl {
     bool need_full_apply = true;
     bool convert_lora_state_to_f16 = false;
     InferRequestSignatureCache lora_state_evaluators;
+
+    struct PreparedTensorCacheEntry {
+        AdapterConfig config;
+        std::vector<LoRAParts<ov::Tensor>> tensors;
+        size_t byte_size = 0;
+    };
+
+    // The cache owns evaluator output tensors for the controller lifetime. Keep a small
+    // LRU bound because every entry contains alpha/A/B outputs for every transformed layer.
+    static constexpr size_t prepared_tensor_cache_capacity = 8;
+    static constexpr size_t prepared_tensor_cache_max_bytes = 512 * 1024 * 1024;
+    std::list<PreparedTensorCacheEntry> prepared_tensor_cache;
+    size_t prepared_tensor_cache_byte_size = 0;
 
     // Stores the actual LoRA weight getter used for Constant tensor replacement
     // Needed to track which LoRA tensors were actually applied to suppress unused tensor warnings
@@ -1392,7 +1406,7 @@ struct AdapterControllerImpl {
                 ov::Tensor(params_getter.type, ov::Shape{0})
             };
             auto name = node->get_friendly_name();
-            auto lora_weight = prepare_lora_tensors(name, params_getter.weight_getter, lora_placeholder, /*set_empty_tensors=*/false, /*alpha_only=*/false);
+            auto lora_weight = prepare_lora_tensors(name, params_getter.weight_getter, lora_placeholder, /*set_empty_tensors=*/false, /*alpha_only=*/false, current_config);
             if(lora_weight.alpha) {
                 return LoRANode(
                     // TODO: Make sure that tensors will not be disposed during constant life time
@@ -1447,6 +1461,8 @@ struct AdapterControllerImpl {
         for(const auto& var: constant_variable_ids) {
             variable_names.insert(var.second.variable_id);
         }
+
+        prepare_initial_configs();
     }
 
     static std::shared_ptr<AdapterImpl> get_adapter_impl(const Adapter& adapter) {
@@ -1457,15 +1473,17 @@ struct AdapterControllerImpl {
         bool mode = false;
         bool alpha = false;
         bool adapter = false;
+        bool tensor_name_prefix = false;
 
         operator bool() const {
-            return mode || alpha || adapter;
+            return mode || alpha || adapter || tensor_name_prefix;
         }
     };
 
     ConfigChanged compare_configs(const AdapterConfig& config1, const AdapterConfig& config2) {
         ConfigChanged diff;
         diff.mode = config1.get_mode() != config2.get_mode();
+        diff.tensor_name_prefix = config1.get_tensor_name_prefix() != config2.get_tensor_name_prefix();
         // TODO: Use `set` from this commented block when the config change tracking is implemented at adapter granularity and will track order of adapters correctly
         // std::set<Adapter>
         //     adapters1(config1.adapters.begin(), config1.adapters.end()),
@@ -1488,20 +1506,22 @@ struct AdapterControllerImpl {
         last_apply_profile = {};  // Reset profile so stale data isn't reported when no real switch occurs
         ConfigChanged diff;
         if(config) {
-            diff = compare_configs(current_config, *config);
+            AdapterConfig updated_config = current_config;
+            updated_config.update(*config);
+            diff = compare_configs(current_config, updated_config);
             OPENVINO_ASSERT(
                 !diff.mode || config->get_mode() == AdapterConfig::MODE_AUTO,  // MODE_AUTO in this call means that mode is not changed
                 "AdapterConfig::mode cannot be changed and should be configured once for a model at the initialization");
             OPENVINO_ASSERT(
                 config->get_mode() == AdapterConfig::MODE_AUTO || config->get_mode() == AdapterConfig::MODE_DYNAMIC || config->get_mode() == AdapterConfig::MODE_STATIC_RANK || (!diff.alpha && !diff.adapter),
                 "Cannot change adapters and/or the alphas when not one of the dynamic modes are used.");
-            current_config.update(*config);
+            current_config = std::move(updated_config);
         }
         if(need_full_apply) {
             need_full_apply = false;
             set_new_adapter_tensors(infer_request);
         } else if(diff) {
-            if(diff.adapter) {
+            if(diff.adapter || diff.tensor_name_prefix) {
                 set_new_adapter_tensors(infer_request);
             } else if(diff.alpha)  {
                 set_new_adapter_alphas(infer_request);
@@ -1515,6 +1535,134 @@ struct AdapterControllerImpl {
 
     void set_new_adapter_alphas (ov::InferRequest& infer_request) {
         set_new_adapter_tensors(infer_request, /*alpha_only=*/true);
+    }
+
+    bool same_prepared_tensor_cache_key(const AdapterConfig& lhs, const AdapterConfig& rhs) const {
+        return lhs.get_mode() == rhs.get_mode() &&
+               lhs.get_tensor_name_prefix() == rhs.get_tensor_name_prefix() &&
+               lhs.get_adapters_and_alphas() == rhs.get_adapters_and_alphas();
+    }
+
+    ov::element::Type state_output_type(const ov::element::Type& state_type) const {
+        return convert_lora_state_to_f16 ? ov::element::f16 : state_type;
+    }
+
+    LoRAParts<ov::Tensor> allocate_lora_state_tensors(const LoRAVarIDs& lora_var_ids) const {
+        return {
+            ov::Tensor(state_output_type(lora_var_ids.alpha.data_type),
+                       dynamic_to_static(lora_var_ids.alpha.data_shape)),
+            ov::Tensor(state_output_type(lora_var_ids.A.data_type),
+                       dynamic_to_static(lora_var_ids.A.data_shape)),
+            ov::Tensor(state_output_type(lora_var_ids.B.data_type),
+                       dynamic_to_static(lora_var_ids.B.data_shape))
+        };
+    }
+
+    std::vector<LoRAWeightGetter> make_weight_getters(const AdapterConfig& config) const {
+        std::vector<LoRAWeightGetter> weight_getters;
+        const auto& adapters = config.get_adapters();
+        weight_getters.reserve(adapters.size());
+        for (const auto& adapter : adapters) {
+            auto adapter_impl = get_adapter_impl(adapter);
+            weight_getters.emplace_back(
+                LoRAWeightGetterDefault<LoRAWeight, LoRANode>(&adapter_impl->get_tensors(),
+                                                              config.get_tensor_name_prefix().value_or(std::string())));
+        }
+        return weight_getters;
+    }
+
+    void validate_prepared_tensor(const ov::Tensor& tensor,
+                                  const ov::op::util::VariableInfo& variable_info) const {
+        OPENVINO_ASSERT(tensor);
+        OPENVINO_ASSERT(tensor.get_element_type() == state_output_type(variable_info.data_type));
+        OPENVINO_ASSERT(variable_info.data_shape.compatible(ov::PartialShape(tensor.get_shape())));
+    }
+
+    std::vector<LoRAParts<ov::Tensor>> prepare_config_tensors(
+        const AdapterConfig& config,
+        const std::vector<LoRAWeightGetter>& weight_getters) {
+        std::vector<LoRAParts<ov::Tensor>> prepared_tensors;
+        prepared_tensors.reserve(variable_ids.size());
+        for (const auto& lora_var_ids : variable_ids) {
+            auto output_tensors = allocate_lora_state_tensors(lora_var_ids.second);
+            auto tensors = prepare_lora_tensors(lora_var_ids.first,
+                                                weight_getters,
+                                                output_tensors,
+                                                /*set_empty_adapters=*/true,
+                                                /*alpha_only=*/false,
+                                                config);
+            validate_prepared_tensor(tensors.alpha, lora_var_ids.second.alpha);
+            validate_prepared_tensor(tensors.A, lora_var_ids.second.A);
+            validate_prepared_tensor(tensors.B, lora_var_ids.second.B);
+            prepared_tensors.push_back(std::move(tensors));
+        }
+        return prepared_tensors;
+    }
+
+    size_t prepared_tensors_byte_size(const std::vector<LoRAParts<ov::Tensor>>& tensors) const {
+        size_t result = 0;
+        for (const auto& tensor_parts : tensors) {
+            result += tensor_parts.alpha.get_byte_size();
+            result += tensor_parts.A.get_byte_size();
+            result += tensor_parts.B.get_byte_size();
+        }
+        return result;
+    }
+
+    const std::vector<LoRAParts<ov::Tensor>>& get_or_prepare_config_tensors(
+        const AdapterConfig& config,
+        const std::vector<LoRAWeightGetter>& weight_getters,
+        bool& cache_hit) {
+        for (auto it = prepared_tensor_cache.begin(); it != prepared_tensor_cache.end(); ++it) {
+            if (same_prepared_tensor_cache_key(it->config, config)) {
+                cache_hit = true;
+                prepared_tensor_cache.splice(prepared_tensor_cache.begin(), prepared_tensor_cache, it);
+                return prepared_tensor_cache.front().tensors;
+            }
+        }
+
+        cache_hit = false;
+        auto tensors = prepare_config_tensors(config, weight_getters);
+        auto byte_size = prepared_tensors_byte_size(tensors);
+
+        // Retain a single oversized entry so a valid config still benefits from caching.
+        // Otherwise evict least-recently-used entries until both limits are satisfied.
+        while (!prepared_tensor_cache.empty() &&
+               (prepared_tensor_cache.size() >= prepared_tensor_cache_capacity ||
+                byte_size > prepared_tensor_cache_max_bytes ||
+                prepared_tensor_cache_byte_size > prepared_tensor_cache_max_bytes - byte_size)) {
+            prepared_tensor_cache_byte_size -= prepared_tensor_cache.back().byte_size;
+            prepared_tensor_cache.pop_back();
+        }
+        prepared_tensor_cache.push_front({config, std::move(tensors), byte_size});
+        prepared_tensor_cache_byte_size += byte_size;
+        return prepared_tensor_cache.front().tensors;
+    }
+
+    void prepare_initial_configs() {
+        if (variable_ids.empty()) {
+            return;
+        }
+
+        std::vector<AdapterConfig> configs;
+        AdapterConfig empty_config(current_config.get_mode());
+        empty_config.set_tensor_name_prefix(current_config.get_tensor_name_prefix());
+        configs.push_back(std::move(empty_config));
+
+        for (const auto& adapter_and_alpha : current_config.get_adapters_and_alphas()) {
+            AdapterConfig single_config(adapter_and_alpha.first,
+                                        adapter_and_alpha.second,
+                                        current_config.get_mode());
+            single_config.set_tensor_name_prefix(current_config.get_tensor_name_prefix());
+            configs.push_back(std::move(single_config));
+        }
+        configs.push_back(current_config);
+
+        for (const auto& config : configs) {
+            auto weight_getters = make_weight_getters(config);
+            bool cache_hit = false;
+            get_or_prepare_config_tensors(config, weight_getters, cache_hit);
+        }
     }
 
     void set_new_adapter_tensors(ov::InferRequest& infer_request, bool alpha_only = false) {        
@@ -1561,7 +1709,15 @@ struct AdapterControllerImpl {
 
         auto t2 = std::chrono::steady_clock::now();
 
-        // Phase 3: set_lora_tensors loop
+        // Phase 3: prepare an unseen config once, then upload cached evaluator outputs.
+        bool cache_hit = false;
+        const auto& prepared_tensors = get_or_prepare_config_tensors(current_config, weight_getters, cache_hit);
+        auto cache_prepare_end = std::chrono::steady_clock::now();
+        const auto cache_prepare_us = PerfMetrics::get_microsec(cache_prepare_end - t2);
+        last_apply_profile.prepare_tensors_us += cache_prepare_us;
+        last_apply_profile.set_lora_tensors_call_us += cache_prepare_us;
+
+        auto prepared_tensor_it = prepared_tensors.begin();
         for(const auto& lora_var_ids : variable_ids) {
             // FIXME: Remove this mapping when the order of state will be the same as the order of variables
             LoRAIndices lora_indices;
@@ -1570,10 +1726,13 @@ struct AdapterControllerImpl {
             lora_indices.B = state_name_to_index.at(lora_var_ids.second.B.variable_id);
             // Cross-check timing measured at the CALL SITE (independent of the in-function brackets)
             auto call_start = std::chrono::steady_clock::now();
-            set_lora_tensors(state, lora_var_ids.first, lora_var_ids.second, lora_indices, weight_getters, alpha_only);
+            OPENVINO_ASSERT(prepared_tensor_it != prepared_tensors.end());
+            set_lora_tensors(state, lora_var_ids.first, lora_indices, *prepared_tensor_it, alpha_only);
+            ++prepared_tensor_it;
             auto call_end = std::chrono::steady_clock::now();
             last_apply_profile.set_lora_tensors_call_us += PerfMetrics::get_microsec(call_end - call_start);
         }
+        OPENVINO_ASSERT(prepared_tensor_it == prepared_tensors.end());
         auto t3 = std::chrono::steady_clock::now();
 
         // Phase 4: set constants
@@ -1622,8 +1781,10 @@ struct AdapterControllerImpl {
         }
     }
 
-    std::vector<LoRAWeight> collect_applicable_tensors (const std::string& lora_name, const std::vector<LoRAWeightGetter>& weight_getters) {
-        const auto& adapters = current_config.get_adapters();
+    std::vector<LoRAWeight> collect_applicable_tensors (const std::string& lora_name,
+                                                        const std::vector<LoRAWeightGetter>& weight_getters,
+                                                        const AdapterConfig& config) {
+        const auto& adapters = config.get_adapters();
         OPENVINO_ASSERT(weight_getters.size() == adapters.size());
         std::vector<LoRAWeight> result;
         result.reserve(weight_getters.size());
@@ -1632,7 +1793,7 @@ struct AdapterControllerImpl {
                 // TODO: Is it practical to use alpha from the adapter file itself. In the current code it is ignored and only alpha from config is used.
                 OPENVINO_ASSERT(lora_tensors->A);
                 OPENVINO_ASSERT(lora_tensors->B);
-                lora_tensors->alpha = alpha_as_constant(current_config.get_alpha(adapters[i]));
+                lora_tensors->alpha = alpha_as_constant(config.get_alpha(adapters[i]));
                 result.push_back(LoRAWeight(
                     std::dynamic_pointer_cast<v0::Constant>(lora_tensors->alpha),
                     std::dynamic_pointer_cast<v0::Constant>(lora_tensors->A),
@@ -1813,7 +1974,7 @@ struct AdapterControllerImpl {
         return from_tensor_vector(output_tensors, alpha_only);
     }
 
-    ov::Shape dynamic_to_static(const ov::PartialShape& pshape) {
+    ov::Shape dynamic_to_static(const ov::PartialShape& pshape) const {
         ov::Shape shape(pshape.rank().get_length());
         for(size_t i = 0; i < pshape.rank().get_length(); ++i) {
             shape[i] = pshape[i].is_dynamic() ? 0 : pshape[i].get_length();
@@ -1824,30 +1985,12 @@ struct AdapterControllerImpl {
     void set_lora_tensors(
         std::vector<VariableState>& state,
         const std::string& name,
-        const LoRAVarIDs& lora_var_ids,
         const LoRAIndices& lora_indices,
-        const std::vector<LoRAWeightGetter>& weight_getters,
+        const LoRAParts<ov::Tensor>& new_tensors,
         bool alpha_only
     ) {
-        // Sub-phase (a): GenAI/CPU work = LoRAParts allocation + concat of LoRA A/B/alpha tensors.
-        // ta starts at the very top so the whole function body is partitioned with no untimed gap:
-        //   t3 - t2 (loop) == Σ prepare_tensors_us + Σ set_state_us  (should hold as an identity)
         auto ta = std::chrono::steady_clock::now();
-        const auto state_output_type = [this](const ov::element::Type& state_type) {
-            return convert_lora_state_to_f16 ? ov::element::f16 : state_type;
-        };
-        LoRAParts<ov::Tensor> lora_state_tensors{
-            ov::Tensor(state_output_type(lora_var_ids.alpha.data_type),
-                       dynamic_to_static(lora_var_ids.alpha.data_shape)),
-            alpha_only ? ov::Tensor()
-                       : ov::Tensor(state_output_type(lora_var_ids.A.data_type),
-                                    dynamic_to_static(lora_var_ids.A.data_shape)),
-            alpha_only ? ov::Tensor()
-                       : ov::Tensor(state_output_type(lora_var_ids.B.data_type),
-                                    dynamic_to_static(lora_var_ids.B.data_shape))
-        };
-        auto new_tensors = prepare_lora_tensors(name, weight_getters, lora_state_tensors, /*set_empty_adapters=*/true, alpha_only);
-        auto tb = std::chrono::steady_clock::now();
+        auto tb = ta;
 
         // Sub-phase (b): GPU plugin state upload (VariableState::set_state).
         // NOTE: this brackets only the host-side enqueue; the actual GPU copy may complete
@@ -1877,9 +2020,10 @@ struct AdapterControllerImpl {
         const std::vector<LoRAWeightGetter>& weight_getters,
         LoRAParts<ov::Tensor>& output,
         bool set_empty_adapters,
-        bool alpha_only
+        bool alpha_only,
+        const AdapterConfig& config
     ) {
-        auto lora_tensors = collect_applicable_tensors(name, weight_getters);  // request A and B regardless of alpha_only, because it is a way to get lora_rank later when alpha is broadcasted
+        auto lora_tensors = collect_applicable_tensors(name, weight_getters, config);  // request A and B regardless of alpha_only, because it is a way to get lora_rank later when alpha is broadcasted
         LoRAParts<ov::Tensor> new_tensors;
         if(!lora_tensors.empty()) {
             new_tensors = concat_adapters(lora_tensors, output, alpha_only);

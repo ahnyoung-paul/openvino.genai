@@ -194,7 +194,7 @@ public:
         float query_state_us = 0.0f;
         float set_lora_tensors_us = 0.0f;
         // Split of set_lora_tensors into ownership-attributable sub-phases:
-        //   prepare_tensors_us -> GenAI/CPU concat evaluator (prepare_lora_tensors)
+        //   prepare_tensors_us -> prepared-output cache lookup/fill (prepare_lora_tensors on miss)
         //   set_state_us        -> OpenVINO GPU plugin state upload (VariableState::set_state)
         float prepare_tensors_us = 0.0f;
         float set_state_us = 0.0f;
