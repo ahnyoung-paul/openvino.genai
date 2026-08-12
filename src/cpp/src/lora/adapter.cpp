@@ -838,31 +838,31 @@ public:
             request.set_input_tensor(i, inputs[rwb.inputs[i]]);
         }
 
-#ifdef LORA_USE_REMOTE_TENSOR
-        const bool device_output = on_device();
-        // CVS-187607: bind DEVICE-LOCAL output tensors created through the remote context.
-        // Note that request.get_output_tensor() would hand back a USMHostTensor (host-accessible
-        // USM), which still triggers a host->device copy in set_state. Tensors created by
-        // create_tensor() with no params are device-local (BT_BUF_INTERNAL) RemoteTensors and
-        // therefore hit the no-copy swap path.
-        ov::RemoteContext device_ctx;
-        if(device_output) {
-            device_ctx = compiled_model.get_context();
-        }
-#endif
+// #ifdef LORA_USE_REMOTE_TENSOR
+//         const bool device_output = on_device();
+//         // CVS-187607: bind DEVICE-LOCAL output tensors created through the remote context.
+//         // Note that request.get_output_tensor() would hand back a USMHostTensor (host-accessible
+//         // USM), which still triggers a host->device copy in set_state. Tensors created by
+//         // create_tensor() with no params are device-local (BT_BUF_INTERNAL) RemoteTensors and
+//         // therefore hit the no-copy swap path.
+//         ov::RemoteContext device_ctx;
+//         if(device_output) {
+//             device_ctx = compiled_model.get_context();
+//         }
+// #endif
         for(size_t i = 0; i < rwb.outputs.size(); ++i) {
             auto target_shape = request.get_compiled_model().output(i).get_partial_shape();
             auto& output_tensor = outputs[rwb.outputs[i]];
-#ifdef LORA_USE_REMOTE_TENSOR
-            if(device_output && target_shape.is_static()) {
-                auto dev_tensor = device_ctx.create_tensor(
-                    request.get_compiled_model().output(i).get_element_type(),
-                    target_shape.get_shape());
-                outputs[rwb.outputs[i]] = dev_tensor;       // hand the device tensor back to the caller
-                request.set_output_tensor(i, dev_tensor);   // and bind it as the request output
-                continue;
-            }
-#endif
+// #ifdef LORA_USE_REMOTE_TENSOR
+//             if(device_output && target_shape.is_static()) {
+//                 auto dev_tensor = device_ctx.create_tensor(
+//                     request.get_compiled_model().output(i).get_element_type(),
+//                     target_shape.get_shape());
+//                 outputs[rwb.outputs[i]] = dev_tensor;       // hand the device tensor back to the caller
+//                 request.set_output_tensor(i, dev_tensor);   // and bind it as the request output
+//                 continue;
+//             }
+// #endif
             if(target_shape != output_tensor.get_shape() && target_shape.is_static()) {
                 // do it for static case only, because if target shape is dynamic, the plugin is allowed to set shape on its own
                 output_tensor.set_shape(target_shape.get_shape());
@@ -870,20 +870,20 @@ public:
             request.set_output_tensor(i, output_tensor);
         }
         for(auto bypass: rwb.bypass) {
-#ifdef LORA_USE_REMOTE_TENSOR
-            if(device_output) {
-                // A bypass is a Parameter->Result pair (single adapter, no concat needed): the
-                // input tensor is forwarded straight to the output. That input is the original
-                // LoRA weight, a HOST tensor, so forwarding it verbatim would send set_state back
-                // to the host->device copy path and defeat the whole optimization. Upload it into
-                // a device tensor here instead.
-                const auto& src = inputs[bypass.first];
-                auto dev_tensor = device_ctx.create_tensor(src.get_element_type(), src.get_shape());
-                src.copy_to(dev_tensor);
-                outputs[bypass.second] = dev_tensor;
-                continue;
-            }
-#endif
+// #ifdef LORA_USE_REMOTE_TENSOR
+//             if(device_output) {
+//                 // A bypass is a Parameter->Result pair (single adapter, no concat needed): the
+//                 // input tensor is forwarded straight to the output. That input is the original
+//                 // LoRA weight, a HOST tensor, so forwarding it verbatim would send set_state back
+//                 // to the host->device copy path and defeat the whole optimization. Upload it into
+//                 // a device tensor here instead.
+//                 const auto& src = inputs[bypass.first];
+//                 auto dev_tensor = device_ctx.create_tensor(src.get_element_type(), src.get_shape());
+//                 src.copy_to(dev_tensor);
+//                 outputs[bypass.second] = dev_tensor;
+//                 continue;
+//             }
+// #endif
             outputs[bypass.second] = inputs[bypass.first];
         }
         request.infer();    // TODO: Consider using async to increase throughput, requires more complicated archestration
