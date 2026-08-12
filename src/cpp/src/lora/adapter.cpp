@@ -1791,10 +1791,20 @@ struct AdapterControllerImpl {
     ) {
         ov::OutputVector concat_inputs;
         concat_inputs.reserve(inputs.size());
+        const auto output_type = output.get_element_type();
+        const bool convert_after_concat =
+            convert_lora_state_to_f16 && output_type == ov::element::f16;
+        ov::element::Type concat_type = ov::element::dynamic;
         for(size_t i = 0; i < inputs.size(); ++i) {
             NodePtr input = parameters[(alpha_only ? 1 : 3)*i + offset] = input_accessor(inputs[i]);
-            if(input->get_output_element_type(0) != output.get_element_type()) {
-                input = std::make_shared<v0::Convert>(input, output.get_element_type());
+            if(convert_after_concat) {
+                if(concat_type == ov::element::dynamic) {
+                    concat_type = input->get_output_element_type(0);
+                } else if(input->get_output_element_type(0) != concat_type) {
+                    input = std::make_shared<v0::Convert>(input, concat_type);
+                }
+            } else if(input->get_output_element_type(0) != output_type) {
+                input = std::make_shared<v0::Convert>(input, output_type);
             }
             if(input->get_output_partial_shape(0).rank().get_length() > 2) {
                 input = squeeze_2d(input);
@@ -1808,6 +1818,9 @@ struct AdapterControllerImpl {
             result = std::make_shared<v0::Concat>(concat_inputs, concat_axis);
         } else {
             result = concat_inputs.front().get_node_shared_ptr();
+        }
+        if(convert_after_concat && result->get_output_element_type(0) != output_type) {
+            result = std::make_shared<v0::Convert>(result, output_type);
         }
 
         results[offset] = std::make_shared<v0::Result>(result);
