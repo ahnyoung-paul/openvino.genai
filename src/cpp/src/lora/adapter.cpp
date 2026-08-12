@@ -1384,6 +1384,7 @@ struct AdapterControllerImpl {
     std::unordered_set<std::string> variable_names;
     AdapterConfig current_config;
     bool need_full_apply = true;
+    bool convert_lora_state_to_f16 = false;
     InferRequestSignatureCache lora_state_evaluators;
 
     // Stores the actual LoRA weight getter used for Constant tensor replacement
@@ -1413,20 +1414,12 @@ struct AdapterControllerImpl {
 
     AdapterControllerImpl(std::shared_ptr<ov::Model> model, const AdapterConfig& config, const std::string& device = "CPU") :
         current_config(config),  // FIXME: Compare current and passed configs and change incrementally
-#ifdef LORA_USE_REMOTE_TENSOR
-        // CVS-187607: when opted in, the concat evaluator runs on the inference device AND keeps
-        // its output in device memory (see evaluate()/on_device()), so the result reaches
-        // VariableState::set_state as a RemoteTensor and is adopted by a no-copy swap.
-        lora_state_evaluators(lora_evaluator_device(device))
-#else
-        // Original path: the concat evaluator always runs on CPU, so set_state performs a
-        // host->device copy. (device is unused here.)
-        lora_state_evaluators("CPU")    // FIXME: Try to run on the same device that is used for model inference
-#endif
+        // Keep the lightweight concat evaluator on CPU. When the base model runs on GPU,
+        // produce f16 host tensors so VariableState::set_state() does not perform the
+        // expensive scalar bf16-to-f16 conversion.
+        convert_lora_state_to_f16(device.find("GPU") != std::string::npos),
+        lora_state_evaluators("CPU")
     {
-#ifndef LORA_USE_REMOTE_TENSOR
-        (void)device;  // unused when the RemoteTensor path is compiled out
-#endif
         LoRAConstantGetter const_getter;
         LoRAParametersByWeightGetter params_getter;
         params_getter.type = ov::element::dynamic;
@@ -1897,10 +1890,16 @@ struct AdapterControllerImpl {
         // ta starts at the very top so the whole function body is partitioned with no untimed gap:
         //   t3 - t2 (loop) == Σ prepare_tensors_us + Σ set_state_us  (should hold as an identity)
         auto ta = std::chrono::steady_clock::now();
+        const auto alpha_type =
+            convert_lora_state_to_f16 ? ov::element::f16 : lora_var_ids.alpha.data_type;
+        const auto A_type =
+            convert_lora_state_to_f16 ? ov::element::f16 : lora_var_ids.A.data_type;
+        const auto B_type =
+            convert_lora_state_to_f16 ? ov::element::f16 : lora_var_ids.B.data_type;
         LoRAParts<ov::Tensor> lora_state_tensors{
-            ov::Tensor(lora_var_ids.alpha.data_type, dynamic_to_static(lora_var_ids.alpha.data_shape)),
-            alpha_only ? ov::Tensor() : ov::Tensor(lora_var_ids.A.data_type, dynamic_to_static(lora_var_ids.A.data_shape)),
-            alpha_only ? ov::Tensor() : ov::Tensor(lora_var_ids.B.data_type, dynamic_to_static(lora_var_ids.B.data_shape))
+            ov::Tensor(alpha_type, dynamic_to_static(lora_var_ids.alpha.data_shape)),
+            alpha_only ? ov::Tensor() : ov::Tensor(A_type, dynamic_to_static(lora_var_ids.A.data_shape)),
+            alpha_only ? ov::Tensor() : ov::Tensor(B_type, dynamic_to_static(lora_var_ids.B.data_shape))
         };
         auto new_tensors = prepare_lora_tensors(name, weight_getters, lora_state_tensors, /*set_empty_adapters=*/true, alpha_only);
         auto tb = std::chrono::steady_clock::now();
