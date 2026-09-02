@@ -49,6 +49,8 @@ def print_metrics(
             output_str += 'Detokenization Time: {:.2f}ms, '.format(tokenization_time[1])
     if iter_data.get('mm_embeddings_preparation_time', '') != '':
         output_str += ' Multimodal Embeddings Preparation Time: {:.2f}ms, '.format(iter_data['mm_embeddings_preparation_time'])
+    if iter_data.get('vision_encoding_time', '') != '':
+        output_str += 'Vision Encoding Time: {:.2f}ms, '.format(iter_data['vision_encoding_time'])
     if iter_data.get('generation_time', '') != '':
         output_str += 'Generation Time: {:.2f}s, '.format(iter_data['generation_time'])
     if prefill_time and prefill_time != "":

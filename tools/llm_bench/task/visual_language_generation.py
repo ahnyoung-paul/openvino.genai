@@ -260,6 +260,12 @@ def run_visual_language_generation_genai(
         np.mean(perf_metrics.raw_metrics.tokenization_durations) / 1000,
         np.mean(perf_metrics.raw_metrics.detokenization_durations) / 1000
     )
+    # Vision encoder inference only. mm_embeddings_preparation_time below spans
+    # the whole get_inputs_embeds() region -- image preprocessing, chat template,
+    # tokenization and the text/image embedding merge -- so it is not a proxy for
+    # vision encoder cost. Reported separately to keep the two distinguishable.
+    # calc_mean_and_std() yields -1 when no image was encoded; drop it then.
+    vision_encoding_time = perf_metrics.get_vision_encoding_duration().mean
     iter_data = gen_output_data.gen_iterate_data(
         iter_idx=num,
         in_size=args['batch_size'] * perf_metrics.get_num_input_tokens(),
@@ -271,6 +277,7 @@ def run_visual_language_generation_genai(
         prompt_idx=prompt_index,
         tokenization_time=tokenization_time,
         mm_embeddings_preparation_time=perf_metrics.get_prepare_embeddings_duration().mean,
+        vision_encoding_time=vision_encoding_time if vision_encoding_time >= 0 else "",
         **memory_metrics,
     )
     iter_data_list.append(iter_data)
