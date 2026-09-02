@@ -159,6 +159,15 @@ def gen_data_to_csv(
     result["chat_idx"] = chat_idx
     result['tokenization_time'] = round(token_time, 5) if token_time != '' else token_time
     result['detokenization_time'] = round(detoken_time, 5) if detoken_time != '' else detoken_time
+    # Vision/multimodal timings. Both are '' for non-multimodal tasks and for the
+    # Optimum path (no vision-encoder hook there), which writes an empty cell.
+    # mm_embeddings_preparation_time spans the whole get_inputs_embeds() region;
+    # vision_encoding_time is the encode_images() part only. Keeping both makes
+    # the residual (preprocessing + text embedding + merge) a plain subtraction.
+    mm_prep_time = iter_data.get('mm_embeddings_preparation_time', '')
+    vision_time = iter_data.get('vision_encoding_time', '')
+    result['mm_embeddings_preparation_time'] = round(mm_prep_time, 5) if mm_prep_time != '' else mm_prep_time
+    result['vision_encoding_time'] = round(vision_time, 5) if vision_time != '' else vision_time
     input_idx = chat_idx if chat_idx != "" else iter_data["prompt_idx"]
     result["start"], result["end"] = output_json.get_timestamp(iter_data["iteration"], input_idx, iter_timestamp)
     result = result | output_json.get_pre_gen_memory_data(memory_data_collector, print_unit=mem_unit)
@@ -212,6 +221,8 @@ def write_result(
         "batch_size",
         "tokenization_time",
         "detokenization_time",
+        "mm_embeddings_preparation_time",
+        "vision_encoding_time",
         "result_md5",
         "start",
         "end",
