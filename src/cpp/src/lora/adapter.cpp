@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <set>
 #include <map>
@@ -41,6 +42,7 @@
 #include "openvino/runtime/properties.hpp"
 
 #include "openvino/genai/lora_adapter.hpp"
+#include "openvino/genai/perf_metrics.hpp"
 
 #include "utils.hpp"
 #include "lora/common.hpp"
@@ -749,7 +751,9 @@ class InferRequestSignatureCache {
 public:
     using Signature = std::string;
 
-    InferRequestSignatureCache(const std::string& device) : device(device) {}
+    InferRequestSignatureCache(const std::string& device, const std::string& infer_device = {}) :
+        device(device),
+        infer_device(infer_device.empty() ? device : infer_device) {}
 
     bool exist (const Signature& signature) {
         return requests.count(signature);
@@ -825,6 +829,21 @@ public:
         }
         request.infer();    // TODO: Consider using async to increase throughput, requires more complicated archestration
 
+        // One-shot report of which LoRA evaluator path is active (set OV_LORA_DIAG=1).
+        static bool diag_once = false;
+        if(!diag_once && std::getenv("OV_LORA_DIAG")) {
+            diag_once = true;
+            const bool evaluator_on_gpu = device.find("GPU") != std::string::npos;
+            const auto output_type =
+                outputs.empty() ? ov::element::dynamic : outputs.front().get_element_type();
+            std::cerr << "[LORA-DIAG][EVAL] evaluator_device=" << static_cast<char>(34) << device << static_cast<char>(34)
+                      << "  infer_device=" << static_cast<char>(34) << infer_device << static_cast<char>(34)
+                      << "  evaluator_on_gpu=" << (evaluator_on_gpu ? 1 : 0)
+                      << "  output_type=" << output_type
+                      << "  outputs=" << outputs.size()
+                      << "  bypass=" << rwb.bypass.size()
+                      << std::endl;
+        }
     }
 
 private:
@@ -835,6 +854,7 @@ private:
 
     std::unordered_map<Signature, RequestWithBypass> requests;
     std::string device;
+    std::string infer_device;
 };
 
 
@@ -1288,6 +1308,22 @@ bool operator== (const Adapter& a, const Adapter& b) {
 
 
 struct AdapterControllerImpl {
+    struct ApplyProfile {
+        float prepare_weight_getters_us = 0.0f;
+        float query_state_us = 0.0f;
+        float set_lora_tensors_us = 0.0f;
+        // Sub-split of set_lora_tensors accumulated across the per-layer loop:
+        //   prepare_tensors_us -> prepared-output cache lookup/fill (prepare_lora_tensors on miss)
+        //   set_state_us        -> GPU plugin state upload (VariableState::set_state)
+        float prepare_tensors_us = 0.0f;
+        float set_state_us = 0.0f;
+        // Cross-check: sum of wall-clock around each set_lora_tensors() CALL SITE in the loop.
+        // Should satisfy: set_lora_tensors_call_us ≈ set_lora_tensors_us (t3-t2)
+        //             and set_lora_tensors_call_us ≈ cache lookup/fill + set_state_us
+        float set_lora_tensors_call_us = 0.0f;
+        float set_constants_us = 0.0f;
+    };
+    ApplyProfile last_apply_profile;
     LoRAVarMap variable_ids;
     std::map<std::string, ov::op::util::VariableInfo> constant_variable_ids;
     std::unordered_set<std::string> variable_names;
@@ -1343,7 +1379,7 @@ struct AdapterControllerImpl {
                           const AdapterConfig& config,
                           const std::string& device = "CPU") :
         current_config(config),  // FIXME: Compare current and passed configs and change incrementally
-        lora_state_evaluators(lora_evaluator_device(device))
+        lora_state_evaluators(lora_evaluator_device(device), device)
     {
         LoRAConstantGetter const_getter;
         LoRAParametersByWeightGetter params_getter;
@@ -1482,6 +1518,7 @@ struct AdapterControllerImpl {
 
     void apply (ov::InferRequest& infer_request, std::optional<AdapterConfig> config) {
         // FIXME: If a part of LoRA state tensors are not set here, then need to carefully reset state in LLMPipeline where global reset is called after the generation
+        last_apply_profile = {};  // Reset profile so stale data isn't reported when no real switch occurs
         ConfigChanged diff;
         if(config) {
             AdapterConfig updated_config = current_config;
@@ -1597,6 +1634,14 @@ struct AdapterControllerImpl {
         prepared_tensor_cache.clear();
         prepared_tensor_cache_byte_size = 0;
         lora_state_evaluators.clear();
+
+        if (std::getenv("OV_LORA_DIAG")) {
+            std::cout << "[LORA-DIAG][TYPE] inference_precision_hint="
+                      << (new_output_type ? new_output_type->get_type_name() : "n/a")
+                      << "  selected_output_type="
+                      << (state_output_type_override ? state_output_type_override->get_type_name() : "declared-state-type")
+                      << std::endl;
+        }
 
         prepare_initial_configs();
     }
@@ -1782,13 +1827,16 @@ struct AdapterControllerImpl {
         }
     }
 
-    void set_new_adapter_tensors(ov::InferRequest& infer_request, bool alpha_only = false) {        
-        if (current_config.get_mode() != AdapterConfig::MODE_AUTO && 
+    void set_new_adapter_tensors(ov::InferRequest& infer_request, bool alpha_only = false) {
+        if (current_config.get_mode() != AdapterConfig::MODE_AUTO &&
             current_config.get_mode() != AdapterConfig::MODE_DYNAMIC &&
             current_config.get_mode() != AdapterConfig::MODE_STATIC_RANK ) {
+            last_apply_profile = {};
             return;
         }
 
+        // Phase 1: prepare weight getters
+        auto t0 = std::chrono::steady_clock::now();
         std::vector<LoRAWeightGetter> weight_getters;
         LoRAConstantGetter const_getter;
         const auto& adapters = current_config.get_adapters();
@@ -1807,6 +1855,9 @@ struct AdapterControllerImpl {
                                                               current_config.get_tensor_name_prefix().value_or("")));
         }
 
+        auto t1 = std::chrono::steady_clock::now();
+
+        // Phase 2: query_state + build index map
         auto state = infer_request.query_state();
         // TODO: Forced to use variable_id instead of index to address the state tensors, require the same order for state as for variables from plugins
 
@@ -1818,9 +1869,11 @@ struct AdapterControllerImpl {
             state_name_to_index[name] = i;
         }
 
-        // An alpha-only update needs neither the cached A/B nor a new cache entry, so evaluate
-        // just the alpha tensors directly. The full path goes through the cache, which refreshes
-        // stale alpha tensors on a hit (see get_or_prepare_config_tensors).
+        auto t2 = std::chrono::steady_clock::now();
+
+        // Phase 3: an alpha-only update needs neither the cached A/B nor a new cache entry, so
+        // evaluate just the alpha tensors directly. The full path goes through the cache, which
+        // refreshes stale alpha tensors on a hit (see get_or_prepare_config_tensors).
         std::vector<LoRAParts<ov::Tensor>> alpha_only_tensors;
         const std::vector<LoRAParts<ov::Tensor>>* prepared_tensors_ptr;
         if (alpha_only) {
@@ -1830,6 +1883,10 @@ struct AdapterControllerImpl {
             prepared_tensors_ptr = &get_or_prepare_config_tensors(current_config, weight_getters);
         }
         const auto& prepared_tensors = *prepared_tensors_ptr;
+        auto cache_prepare_end = std::chrono::steady_clock::now();
+        const auto cache_prepare_us = PerfMetrics::get_microsec(cache_prepare_end - t2);
+        last_apply_profile.prepare_tensors_us += cache_prepare_us;
+        last_apply_profile.set_lora_tensors_call_us += cache_prepare_us;
 
         auto prepared_tensor_it = prepared_tensors.begin();
         for(const auto& lora_var_ids : variable_ids) {
@@ -1838,12 +1895,18 @@ struct AdapterControllerImpl {
             lora_indices.alpha = state_name_to_index.at(lora_var_ids.second.alpha.variable_id);
             lora_indices.A = state_name_to_index.at(lora_var_ids.second.A.variable_id);
             lora_indices.B = state_name_to_index.at(lora_var_ids.second.B.variable_id);
+            // Cross-check timing measured at the CALL SITE (independent of the in-function brackets)
+            auto call_start = std::chrono::steady_clock::now();
             OPENVINO_ASSERT(prepared_tensor_it != prepared_tensors.end());
-            set_lora_tensors(state, lora_indices, *prepared_tensor_it, alpha_only);
+            set_lora_tensors(state, lora_var_ids.first, lora_indices, *prepared_tensor_it, alpha_only);
             ++prepared_tensor_it;
+            auto call_end = std::chrono::steady_clock::now();
+            last_apply_profile.set_lora_tensors_call_us += PerfMetrics::get_microsec(call_end - call_start);
         }
         OPENVINO_ASSERT(prepared_tensor_it == prepared_tensors.end());
+        auto t3 = std::chrono::steady_clock::now();
 
+        // Phase 4: set constants
         for (const auto& [const_name, var_info] : constant_variable_ids) {
 
             size_t const_lora_index = state_name_to_index.at(var_info.variable_id);
@@ -1867,6 +1930,25 @@ struct AdapterControllerImpl {
                 std::memcpy(const_tensor.data(), constant_node->get_data_ptr(), const_tensor.get_byte_size());
                 state[const_lora_index].set_state(const_tensor);
             }
+        }
+        auto t4 = std::chrono::steady_clock::now();
+
+        // Record profiling
+        last_apply_profile.prepare_weight_getters_us = PerfMetrics::get_microsec(t1 - t0);
+        last_apply_profile.query_state_us = PerfMetrics::get_microsec(t2 - t1);
+        last_apply_profile.set_lora_tensors_us = PerfMetrics::get_microsec(t3 - t2);
+        last_apply_profile.set_constants_us = PerfMetrics::get_microsec(t4 - t3);
+
+        // [DIAG] Identity cross-check. Should hold:
+        //   loop(t3-t2) ≈ call_site_sum ≈ prepare_tensors + set_state
+        if (last_apply_profile.set_lora_tensors_us > 1000.0f) {  // only for real switches
+            std::cerr << "[LORA-DIAG] iters=" << variable_ids.size()
+                      << "  loop(t3-t2)=" << last_apply_profile.set_lora_tensors_us / 1000.0f << "ms"
+                      << "  call_site_sum=" << last_apply_profile.set_lora_tensors_call_us / 1000.0f << "ms"
+                      << "  prepare_tensors=" << last_apply_profile.prepare_tensors_us / 1000.0f << "ms"
+                      << "  set_state=" << last_apply_profile.set_state_us / 1000.0f << "ms"
+                      << "  (pt+ss=" << (last_apply_profile.prepare_tensors_us + last_apply_profile.set_state_us) / 1000.0f << "ms)"
+                      << std::endl;
         }
     }
 
@@ -2067,15 +2149,30 @@ struct AdapterControllerImpl {
 
     void set_lora_tensors(
         std::vector<VariableState>& state,
+        const std::string& name,
         const LoRAIndices& lora_indices,
         const LoRAParts<ov::Tensor>& new_tensors,
         bool alpha_only
     ) {
+        // Sub-phase: GPU plugin state upload (VariableState::set_state).
+        // NOTE: this brackets only the host-side enqueue; the actual GPU copy may complete
+        // asynchronously and thus may NOT be attributed here.
+        auto ta = std::chrono::steady_clock::now();
         state[lora_indices.alpha].set_state(new_tensors.alpha);
         if(!alpha_only) {
             state[lora_indices.A].set_state(new_tensors.A);
             state[lora_indices.B].set_state(new_tensors.B);
         }
+        auto tc = std::chrono::steady_clock::now();
+
+        // Accumulate across the per-layer loop (reset happens in set_new_adapter_tensors())
+        float set_state_us = PerfMetrics::get_microsec(tc - ta);
+        if (std::getenv("OV_LORA_DIAG")) {
+            std::cout << "[LORA-DIAG] " << name
+                      << "  set_state=" << set_state_us / 1000.0f << "ms"
+                      << std::endl;
+        }
+        last_apply_profile.set_state_us += set_state_us;
     }
 
     LoRAParts<ov::Tensor> prepare_lora_tensors (
@@ -2247,6 +2344,15 @@ void AdapterConfig::set_adapters_and_alphas(const std::vector<std::pair<Adapter,
         adapters.push_back(adapter_and_alpha.first);
         alphas.push_back(adapter_and_alpha.second);
     }
+}
+
+AdapterController::ApplyProfile AdapterController::get_last_apply_profile() const {
+    if (m_pimpl) {
+        auto& p = m_pimpl->last_apply_profile;
+        return {p.prepare_weight_getters_us, p.query_state_us, p.set_lora_tensors_us,
+                p.prepare_tensors_us, p.set_state_us, p.set_constants_us};
+    }
+    return {};
 }
 
 
