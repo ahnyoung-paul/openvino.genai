@@ -12,6 +12,11 @@ from conftest import SAMPLES_PY_DIR, SAMPLES_CPP_DIR
 from test_utils import run_sample
 from PIL import Image
 
+
+def get_device_name():
+    return os.getenv("LORA_TEST_DEVICE_NAME", "CPU")
+
+
 class TestLora:
     @pytest.mark.llm
     @pytest.mark.samples
@@ -217,7 +222,7 @@ class TestLora:
         config_b = ov_genai.AdapterConfig()
         config_b.add(adapter, 0.0)
 
-        pipe = ov_genai.VLMPipeline(convert_model, "CPU", ATTENTION_BACKEND="PA", adapters=config_a)
+        pipe = ov_genai.VLMPipeline(convert_model, get_device_name(), ATTENTION_BACKEND="PA", adapters=config_a)
 
         generation_config = ov_genai.GenerationConfig()
         generation_config.max_new_tokens = 100
@@ -306,11 +311,11 @@ class TestLora:
         # Release each baseline before creating the next pipeline to limit peak model memory.
         expected = []
         for config in (config_a, config_b):
-            baseline = ov_genai.VLMPipeline(convert_model, "CPU", ATTENTION_BACKEND="PA", adapters=config)
+            baseline = ov_genai.VLMPipeline(convert_model, get_device_name(), ATTENTION_BACKEND="PA", adapters=config)
             expected.append(generate(baseline, config))
             del baseline
 
-        pipe = ov_genai.VLMPipeline(convert_model, "CPU", ATTENTION_BACKEND="PA", adapters=config_ab)
+        pipe = ov_genai.VLMPipeline(convert_model, get_device_name(), ATTENTION_BACKEND="PA", adapters=config_ab)
         first_ab = generate(pipe, config_ab)
         assert generate(pipe, config_a) == expected[0], "First concat interval should match adapter A alone"
         assert generate(pipe, config_b) == expected[1], "Second concat interval should match adapter B alone"
