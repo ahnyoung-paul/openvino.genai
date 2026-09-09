@@ -623,7 +623,7 @@ protected:
     bool apply(NodePtr node, const NodePtr& lora_weight) override {
         auto consumers = node->get_output_target_inputs(0);
         const auto node_type = node->get_element_type();
-    
+
         // cast to node type
         auto lora_output = lora_weight;
         if (lora_weight->get_element_type() != node_type) {
@@ -1114,8 +1114,8 @@ std::string convert_gguf_name_to_hf(const std::string& name) {
         if (num_end != std::string::npos) {
             std::string layer_num = new_name.substr(num_start, num_end - num_start);
             // Verify it's actually a number
-            bool is_number = !layer_num.empty() && 
-                           std::all_of(layer_num.begin(), layer_num.end(), 
+            bool is_number = !layer_num.empty() &&
+                           std::all_of(layer_num.begin(), layer_num.end(),
                                      [](unsigned char c){ return std::isdigit(c); });
             if (is_number) {
                 std::string replacement = "model.layers." + layer_num + ".";
@@ -1158,7 +1158,7 @@ std::string convert_gguf_name_to_hf(const std::string& name) {
             pos += hf_part.length(); // continue after replaced part
         }
     }
-    
+
     return new_name;
 }
 
@@ -1324,6 +1324,7 @@ struct AdapterControllerImpl {
         float set_constants_us = 0.0f;
     };
     ApplyProfile last_apply_profile;
+    size_t apply_call_count = 0;
     LoRAVarMap variable_ids;
     std::map<std::string, ov::op::util::VariableInfo> constant_variable_ids;
     std::unordered_set<std::string> variable_names;
@@ -1458,7 +1459,7 @@ struct AdapterControllerImpl {
             // Separate constant mode
             pm.register_pass<LoRASeparateTransform>(weight_as_constant);
             pm.register_pass<LoRAReplaceConstantTransformStatic>(const_replacement_getter);
-            
+
         } else if(mode == AdapterConfig::MODE_FUSE) {
             // Fuse mode
             pm.register_pass<LoRAFuseTransform>(weight_as_constant);
@@ -1519,6 +1520,7 @@ struct AdapterControllerImpl {
     void apply (ov::InferRequest& infer_request, std::optional<AdapterConfig> config) {
         // FIXME: If a part of LoRA state tensors are not set here, then need to carefully reset state in LLMPipeline where global reset is called after the generation
         last_apply_profile = {};  // Reset profile so stale data isn't reported when no real switch occurs
+        const auto apply_call = ++apply_call_count;
         ConfigChanged diff;
         if(config) {
             AdapterConfig updated_config = current_config;
@@ -1534,7 +1536,28 @@ struct AdapterControllerImpl {
         }
         prepare(infer_request);
         bool is_new_infer_request = !last_applied_infer_request || *last_applied_infer_request != infer_request;
-        if(need_full_apply || is_new_infer_request) {
+        const bool requires_full_apply = need_full_apply || is_new_infer_request;
+        if (std::getenv("OV_LORA_DIAG")) {
+            std::cout << "[LORA-DIAG][APPLY] call=" << apply_call
+                      << " config_arg=" << (config ? 1 : 0)
+                      << " new_request=" << (is_new_infer_request ? 1 : 0)
+                      << " need_full_apply=" << (need_full_apply ? 1 : 0)
+                      << " diff(adapter=" << (diff.adapter ? 1 : 0)
+                      << ",alpha=" << (diff.alpha ? 1 : 0)
+                      << ",prefix=" << (diff.tensor_name_prefix ? 1 : 0) << ")"
+                      << " action=";
+            if (requires_full_apply) {
+                std::cout << "full_set_state";
+            } else if (diff.adapter || diff.tensor_name_prefix) {
+                std::cout << "adapter_set_state";
+            } else if (diff.alpha) {
+                std::cout << "alpha_set_state";
+            } else {
+                std::cout << "noop";
+            }
+            std::cout << std::endl;
+        }
+        if(requires_full_apply) {
             need_full_apply = false;
             last_applied_infer_request = infer_request;
             set_new_adapter_tensors(infer_request);
