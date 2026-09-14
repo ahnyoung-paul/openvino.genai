@@ -1487,7 +1487,7 @@ struct AdapterControllerImpl {
 
     AdapterControllerImpl(std::shared_ptr<ov::Model> model, const AdapterConfig& config) :
         current_config(config),  // FIXME: Compare current and passed configs and change incrementally
-        lora_state_evaluators(lora_evaluator_device(device))
+        lora_state_evaluators("CPU")    // FIXME: Try to run on the same device that is used for model inference
     {
         LoRAConstantGetter const_getter;
         LoRAParametersByWeightGetter params_getter;
