@@ -521,6 +521,14 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
         gen_result.extended_perf_metrics = result.extended_perf_metrics;
 
         gen_result.perf_metrics.vlm_raw_metrics = vlm_perf_metrics[i].vlm_raw_metrics;
+        if (m_last_adapter_switch_duration.count() > 0) {
+            auto& raw = gen_result.perf_metrics.vlm_raw_metrics;
+            raw.adapter_switch_durations.emplace_back(m_last_adapter_switch_duration);
+            raw.adapter_prepare_weight_getters_durations.emplace_back(m_last_apply_profile.prepare_weight_getters_us);
+            raw.adapter_query_state_durations.emplace_back(m_last_apply_profile.query_state_us);
+            raw.adapter_set_lora_tensors_durations.emplace_back(m_last_apply_profile.set_lora_tensors_us);
+            raw.adapter_set_constants_durations.emplace_back(m_last_apply_profile.set_constants_us);
+        }
         gen_result.perf_metrics.raw_metrics.tokenization_durations = vlm_perf_metrics[i].raw_metrics.tokenization_durations;
         gen_result.perf_metrics.raw_metrics.chat_template_durations = vlm_perf_metrics[i].raw_metrics.chat_template_durations;
         gen_result.perf_metrics.raw_metrics.detokenization_durations = vlm_perf_metrics[i].raw_metrics.detokenization_durations;
@@ -766,6 +774,14 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
         gen_result.extended_perf_metrics = result.extended_perf_metrics;
 
         gen_result.perf_metrics.vlm_raw_metrics = vlm_perf_metrics[i].vlm_raw_metrics;
+        if (m_last_adapter_switch_duration.count() > 0) {
+            auto& raw = gen_result.perf_metrics.vlm_raw_metrics;
+            raw.adapter_switch_durations.emplace_back(m_last_adapter_switch_duration);
+            raw.adapter_prepare_weight_getters_durations.emplace_back(m_last_apply_profile.prepare_weight_getters_us);
+            raw.adapter_query_state_durations.emplace_back(m_last_apply_profile.query_state_us);
+            raw.adapter_set_lora_tensors_durations.emplace_back(m_last_apply_profile.set_lora_tensors_us);
+            raw.adapter_set_constants_durations.emplace_back(m_last_apply_profile.set_constants_us);
+        }
         gen_result.perf_metrics.raw_metrics.tokenization_durations = vlm_perf_metrics[i].raw_metrics.tokenization_durations;
         gen_result.perf_metrics.raw_metrics.chat_template_durations = vlm_perf_metrics[i].raw_metrics.chat_template_durations;
         gen_result.perf_metrics.raw_metrics.detokenization_durations = vlm_perf_metrics[i].raw_metrics.detokenization_durations;

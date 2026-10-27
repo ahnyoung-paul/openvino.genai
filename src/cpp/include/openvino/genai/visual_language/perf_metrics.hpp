@@ -13,6 +13,16 @@ namespace ov::genai {
 struct OPENVINO_GENAI_EXPORTS VLMRawPerfMetrics {
     /** @brief Duration of preparation of embeddings */
     std::vector<MicroSeconds> prepare_embeddings_durations;
+    /** @brief Host wall-clock duration of applying the adapter configuration. */
+    std::vector<MicroSeconds> adapter_switch_durations;
+    /** @brief Duration of preparing weight getters. */
+    std::vector<MicroSeconds> adapter_prepare_weight_getters_durations;
+    /** @brief Duration of querying states and building their index map. */
+    std::vector<MicroSeconds> adapter_query_state_durations;
+    /** @brief Cached tensor preparation and state application, including loop overhead. */
+    std::vector<MicroSeconds> adapter_set_lora_tensors_durations;
+    /** @brief Duration of setting constant tensors. */
+    std::vector<MicroSeconds> adapter_set_constants_durations;
     /** @brief Duration of vision encoding */
     std::vector<MicroSeconds> vision_encoding_durations;
     /** @brief Duration of audio encoding */
@@ -26,6 +36,16 @@ struct OPENVINO_GENAI_EXPORTS VLMRawPerfMetrics {
 struct OPENVINO_GENAI_EXPORTS VLMPerfMetrics : public PerfMetrics {
     /** @brief Mean and standard deviation of preparation of embeddings in milliseconds */
     MeanStdPair prepare_embeddings_duration;
+    /** @brief Mean and standard deviation of adapter switching in milliseconds. */
+    MeanStdPair adapter_switch_duration;
+    /** @brief Mean and standard deviation of weight getter preparation in milliseconds. */
+    MeanStdPair adapter_prepare_weight_getters_duration;
+    /** @brief Mean and standard deviation of state queries and indexing in milliseconds. */
+    MeanStdPair adapter_query_state_duration;
+    /** @brief Mean and standard deviation of tensor preparation and application in milliseconds. */
+    MeanStdPair adapter_set_lora_tensors_duration;
+    /** @brief Mean and standard deviation of constant tensor application in milliseconds. */
+    MeanStdPair adapter_set_constants_duration;
     /** @brief Mean and standard deviation of vision encoding in milliseconds */
     MeanStdPair vision_encoding_duration;
     /** @brief Mean and standard deviation of audio encoding in milliseconds */
@@ -36,6 +56,11 @@ struct OPENVINO_GENAI_EXPORTS VLMPerfMetrics : public PerfMetrics {
     size_t total_image_slice_count = 0;
 
     MeanStdPair get_prepare_embeddings_duration();
+    MeanStdPair get_adapter_switch_duration();
+    MeanStdPair get_adapter_prepare_weight_getters_duration();
+    MeanStdPair get_adapter_query_state_duration();
+    MeanStdPair get_adapter_set_lora_tensors_duration();
+    MeanStdPair get_adapter_set_constants_duration();
     MeanStdPair get_vision_encoding_duration();
     MeanStdPair get_audio_encoding_duration();
     MeanStdPair get_text_embedding_duration();

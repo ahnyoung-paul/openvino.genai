@@ -11,6 +11,31 @@ MeanStdPair VLMPerfMetrics::get_prepare_embeddings_duration() {
     return prepare_embeddings_duration;
 }
 
+MeanStdPair VLMPerfMetrics::get_adapter_switch_duration() {
+    evaluate_statistics();
+    return adapter_switch_duration;
+}
+
+MeanStdPair VLMPerfMetrics::get_adapter_prepare_weight_getters_duration() {
+    evaluate_statistics();
+    return adapter_prepare_weight_getters_duration;
+}
+
+MeanStdPair VLMPerfMetrics::get_adapter_query_state_duration() {
+    evaluate_statistics();
+    return adapter_query_state_duration;
+}
+
+MeanStdPair VLMPerfMetrics::get_adapter_set_lora_tensors_duration() {
+    evaluate_statistics();
+    return adapter_set_lora_tensors_duration;
+}
+
+MeanStdPair VLMPerfMetrics::get_adapter_set_constants_duration() {
+    evaluate_statistics();
+    return adapter_set_constants_duration;
+}
+
 MeanStdPair VLMPerfMetrics::get_vision_encoding_duration() {
     evaluate_statistics();
     return vision_encoding_duration;
@@ -37,6 +62,12 @@ void VLMPerfMetrics::evaluate_statistics(std::optional<TimePoint> start_time) {
     }
 
     prepare_embeddings_duration = ov::genai::calc_mean_and_std(vlm_raw_metrics.prepare_embeddings_durations);
+    adapter_switch_duration = calc_mean_and_std(vlm_raw_metrics.adapter_switch_durations);
+    adapter_prepare_weight_getters_duration =
+        calc_mean_and_std(vlm_raw_metrics.adapter_prepare_weight_getters_durations);
+    adapter_query_state_duration = calc_mean_and_std(vlm_raw_metrics.adapter_query_state_durations);
+    adapter_set_lora_tensors_duration = calc_mean_and_std(vlm_raw_metrics.adapter_set_lora_tensors_durations);
+    adapter_set_constants_duration = calc_mean_and_std(vlm_raw_metrics.adapter_set_constants_durations);
     vision_encoding_duration = ov::genai::calc_mean_and_std(vlm_raw_metrics.vision_encoding_durations);
     audio_encoding_duration = ov::genai::calc_mean_and_std(vlm_raw_metrics.audio_encoding_durations);
     text_embedding_duration = ov::genai::calc_mean_and_std(vlm_raw_metrics.text_embedding_durations);
@@ -53,6 +84,17 @@ VLMPerfMetrics VLMPerfMetrics::operator+(const VLMPerfMetrics& right) const {
     VLMPerfMetrics result{std::move(base_result)};
 
     result.vlm_raw_metrics = vlm_raw_metrics;
+
+    for (const auto member : {
+             &VLMRawPerfMetrics::adapter_switch_durations,
+             &VLMRawPerfMetrics::adapter_prepare_weight_getters_durations,
+             &VLMRawPerfMetrics::adapter_query_state_durations,
+             &VLMRawPerfMetrics::adapter_set_lora_tensors_durations,
+             &VLMRawPerfMetrics::adapter_set_constants_durations}) {
+        auto& durations = result.vlm_raw_metrics.*member;
+        const auto& right_durations = right.vlm_raw_metrics.*member;
+        durations.insert(durations.end(), right_durations.begin(), right_durations.end());
+    }
 
     auto& result_prepare_embeddings_durations = result.vlm_raw_metrics.prepare_embeddings_durations;
     auto& right_prepare_embeddings_durations = right.vlm_raw_metrics.prepare_embeddings_durations;

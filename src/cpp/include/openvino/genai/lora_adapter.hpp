@@ -189,6 +189,16 @@ class OPENVINO_GENAI_EXPORTS AdapterController {
 
 public:
 
+    /** @brief Host wall-clock durations of the last apply() call, in microseconds. */
+    struct ApplyProfile {
+        float prepare_weight_getters_us = 0.0f;
+        float query_state_us = 0.0f;
+        /** @brief Includes cached tensor preparation and the state application loop. */
+        float set_lora_tensors_us = 0.0f;
+        float set_constants_us = 0.0f;
+    };
+    ApplyProfile get_last_apply_profile() const;
+
     AdapterController() = default;
 
     AdapterController(std::shared_ptr<ov::Model> model, const AdapterConfig& config, std::string device);

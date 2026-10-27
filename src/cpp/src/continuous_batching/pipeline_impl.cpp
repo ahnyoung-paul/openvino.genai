@@ -823,8 +823,14 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::_step() {
 }
 
 void ContinuousBatchingPipeline::ContinuousBatchingImpl::set_adapters(const std::optional<AdapterConfig>& adapters) {
+    m_last_adapter_switch_duration = MicroSeconds{0.0f};
+    m_last_apply_profile = {};
     if (m_adapter_controller) {
+        const auto adapter_switch_start = std::chrono::steady_clock::now();
         m_adapter_controller->apply(m_model_runner->get_infer_request(), adapters);
+        m_last_adapter_switch_duration =
+            MicroSeconds{PerfMetrics::get_microsec(std::chrono::steady_clock::now() - adapter_switch_start)};
+        m_last_apply_profile = m_adapter_controller->get_last_apply_profile();
     }
 }
 

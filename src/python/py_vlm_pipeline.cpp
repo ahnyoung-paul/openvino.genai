@@ -268,6 +268,14 @@ auto vlm_generate_history_kwargs_docstring = std::string(vlm_generate_descriptio
 auto raw_perf_metrics_docstring = R"(
     Structure with VLM specific raw performance metrics for each generation before any statistics are calculated.
 
+    LoRA profiling exposes adapter_switch_durations and the adapter_prepare_weight_getters,
+    adapter_query_state, adapter_set_lora_tensors, and adapter_set_constants duration lists
+    (with the _durations suffix). These Python lists contain microseconds. The set_lora_tensors
+    phase includes cache lookup, tensor preparation, and state application on the host;
+    it does not measure GPU device execution time. Corresponding VLMPerfMetrics methods
+    return mean and standard deviation in milliseconds, for example:
+        results.perf_metrics.get_adapter_switch_duration().mean
+
     :param prepare_embeddings_durations: Durations of embeddings preparation.
     :type prepare_embeddings_durations: list[MicroSeconds]
 
@@ -439,6 +447,21 @@ void init_video_metadata(py::module_& m) {
 void init_vlm_pipeline(py::module_& m) {
     py::class_<ov::genai::VLMRawPerfMetrics>(m, "VLMRawPerfMetrics", raw_perf_metrics_docstring)
         .def(py::init<>())
+        .def_property_readonly("adapter_switch_durations", [](const ov::genai::VLMRawPerfMetrics& rw) {
+            return common_utils::get_ms(rw, &ov::genai::VLMRawPerfMetrics::adapter_switch_durations);
+        })
+        .def_property_readonly("adapter_prepare_weight_getters_durations", [](const ov::genai::VLMRawPerfMetrics& rw) {
+            return common_utils::get_ms(rw, &ov::genai::VLMRawPerfMetrics::adapter_prepare_weight_getters_durations);
+        })
+        .def_property_readonly("adapter_query_state_durations", [](const ov::genai::VLMRawPerfMetrics& rw) {
+            return common_utils::get_ms(rw, &ov::genai::VLMRawPerfMetrics::adapter_query_state_durations);
+        })
+        .def_property_readonly("adapter_set_lora_tensors_durations", [](const ov::genai::VLMRawPerfMetrics& rw) {
+            return common_utils::get_ms(rw, &ov::genai::VLMRawPerfMetrics::adapter_set_lora_tensors_durations);
+        })
+        .def_property_readonly("adapter_set_constants_durations", [](const ov::genai::VLMRawPerfMetrics& rw) {
+            return common_utils::get_ms(rw, &ov::genai::VLMRawPerfMetrics::adapter_set_constants_durations);
+        })
         .def_property_readonly("prepare_embeddings_durations", [](const ov::genai::VLMRawPerfMetrics& rw) {
             return common_utils::get_ms(rw, &ov::genai::VLMRawPerfMetrics::prepare_embeddings_durations);
         })
@@ -456,6 +479,11 @@ void init_vlm_pipeline(py::module_& m) {
     py::class_<ov::genai::VLMPerfMetrics, ov::genai::PerfMetrics>(m, "VLMPerfMetrics", perf_metrics_docstring)
         .def(py::init<>())
         .def("get_prepare_embeddings_duration", &ov::genai::VLMPerfMetrics::get_prepare_embeddings_duration)
+        .def("get_adapter_switch_duration", &ov::genai::VLMPerfMetrics::get_adapter_switch_duration)
+        .def("get_adapter_prepare_weight_getters_duration", &ov::genai::VLMPerfMetrics::get_adapter_prepare_weight_getters_duration)
+        .def("get_adapter_query_state_duration", &ov::genai::VLMPerfMetrics::get_adapter_query_state_duration)
+        .def("get_adapter_set_lora_tensors_duration", &ov::genai::VLMPerfMetrics::get_adapter_set_lora_tensors_duration)
+        .def("get_adapter_set_constants_duration", &ov::genai::VLMPerfMetrics::get_adapter_set_constants_duration)
         .def("get_vision_encoding_duration", &ov::genai::VLMPerfMetrics::get_vision_encoding_duration)
         .def("get_audio_encoding_duration", &ov::genai::VLMPerfMetrics::get_audio_encoding_duration)
         .def("get_text_embedding_duration", &ov::genai::VLMPerfMetrics::get_text_embedding_duration)

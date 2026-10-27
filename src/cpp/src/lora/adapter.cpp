@@ -39,6 +39,7 @@
 #include "openvino/pass/graph_rewrite.hpp"
 #include "openvino/pass/manager.hpp"
 #include "openvino/genai/lora_adapter.hpp"
+#include "openvino/genai/perf_metrics.hpp"
 
 #include "utils.hpp"
 #include "lora/common.hpp"
@@ -1529,6 +1530,7 @@ private:
 
 
 struct AdapterControllerImpl {
+    AdapterController::ApplyProfile last_apply_profile;
     LoRAVarMap variable_ids;
     std::map<std::string, ov::op::util::VariableInfo> constant_variable_ids;
     std::unordered_set<std::string> variable_names;
@@ -1690,6 +1692,7 @@ struct AdapterControllerImpl {
 
     void apply (ov::InferRequest& infer_request, std::optional<AdapterConfig> config) {
         // FIXME: If a part of LoRA state tensors are not set here, then need to carefully reset state in LLMPipeline where global reset is called after the generation
+        last_apply_profile = {};
         ConfigChanged diff;
         if(config) {
             AdapterConfig updated_config = current_config;
@@ -1948,6 +1951,7 @@ struct AdapterControllerImpl {
             return;
         }
 
+        const auto prepare_weight_getters_start = std::chrono::steady_clock::now();
         std::vector<LoRAWeightGetter> weight_getters;
         LoRAConstantGetter const_getter;
         const auto& adapters = current_config.get_adapters();
@@ -1966,6 +1970,7 @@ struct AdapterControllerImpl {
                                                               current_config.get_tensor_name_prefix().value_or("")));
         }
 
+        const auto query_state_start = std::chrono::steady_clock::now();
         auto state = infer_request.query_state();
         // TODO: Forced to use variable_id instead of index to address the state tensors, require the same order for state as for variables from plugins
 
@@ -1977,6 +1982,7 @@ struct AdapterControllerImpl {
             state_name_to_index[name] = i;
         }
 
+        const auto set_lora_tensors_start = std::chrono::steady_clock::now();
         // An alpha-only update needs neither the cached A/B nor a new cache entry, so evaluate
         // just the alpha tensors directly. The full path goes through the cache, which refreshes
         // stale alpha tensors on a hit (see get_or_prepare_config_tensors).
@@ -1997,6 +2003,7 @@ struct AdapterControllerImpl {
         }
         OPENVINO_ASSERT(prepared_tensor_it == prepared_tensors.end());
 
+        const auto set_constants_start = std::chrono::steady_clock::now();
         for (const auto& [const_name, var_info] : constant_variable_ids) {
 
             size_t const_lora_index = state_name_to_index.at(var_info.variable_id);
@@ -2021,6 +2028,13 @@ struct AdapterControllerImpl {
                 state[const_lora_index].set_state(const_tensor);
             }
         }
+        const auto set_constants_end = std::chrono::steady_clock::now();
+        last_apply_profile.prepare_weight_getters_us =
+            PerfMetrics::get_microsec(query_state_start - prepare_weight_getters_start);
+        last_apply_profile.query_state_us = PerfMetrics::get_microsec(set_lora_tensors_start - query_state_start);
+        last_apply_profile.set_lora_tensors_us =
+            PerfMetrics::get_microsec(set_constants_start - set_lora_tensors_start);
+        last_apply_profile.set_constants_us = PerfMetrics::get_microsec(set_constants_end - set_constants_start);
     }
 
     std::vector<LoRAWeight> collect_applicable_tensors (const std::string& lora_name,
@@ -2394,6 +2408,10 @@ void AdapterConfig::set_adapters_and_alphas(const std::vector<std::pair<Adapter,
         adapters.push_back(adapter_and_alpha.first);
         alphas.push_back(adapter_and_alpha.second);
     }
+}
+
+AdapterController::ApplyProfile AdapterController::get_last_apply_profile() const {
+    return m_pimpl ? m_pimpl->last_apply_profile : ApplyProfile{};
 }
 
 

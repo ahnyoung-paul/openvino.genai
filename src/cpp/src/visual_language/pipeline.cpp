@@ -527,6 +527,16 @@ public:
         res_raw_counters.chat_template_durations.insert(res_raw_counters.chat_template_durations.end(), raw_counters.chat_template_durations.begin(), raw_counters.chat_template_durations.end());
 
         // VLM specific perf metrics
+        decoded.perf_metrics.vlm_raw_metrics.adapter_switch_durations =
+            perf_metrics.vlm_raw_metrics.adapter_switch_durations;
+        decoded.perf_metrics.vlm_raw_metrics.adapter_prepare_weight_getters_durations =
+            perf_metrics.vlm_raw_metrics.adapter_prepare_weight_getters_durations;
+        decoded.perf_metrics.vlm_raw_metrics.adapter_query_state_durations =
+            perf_metrics.vlm_raw_metrics.adapter_query_state_durations;
+        decoded.perf_metrics.vlm_raw_metrics.adapter_set_lora_tensors_durations =
+            perf_metrics.vlm_raw_metrics.adapter_set_lora_tensors_durations;
+        decoded.perf_metrics.vlm_raw_metrics.adapter_set_constants_durations =
+            perf_metrics.vlm_raw_metrics.adapter_set_constants_durations;
         decoded.perf_metrics.vlm_raw_metrics.prepare_embeddings_durations.insert(
             decoded.perf_metrics.vlm_raw_metrics.prepare_embeddings_durations.end(),
             perf_metrics.vlm_raw_metrics.prepare_embeddings_durations.begin(),
@@ -715,6 +725,16 @@ public:
         res_raw_counters.chat_template_durations.insert(res_raw_counters.chat_template_durations.end(), raw_counters.chat_template_durations.begin(), raw_counters.chat_template_durations.end());
 
         // VLM specific perf metrics
+        decoded.perf_metrics.vlm_raw_metrics.adapter_switch_durations =
+            perf_metrics.vlm_raw_metrics.adapter_switch_durations;
+        decoded.perf_metrics.vlm_raw_metrics.adapter_prepare_weight_getters_durations =
+            perf_metrics.vlm_raw_metrics.adapter_prepare_weight_getters_durations;
+        decoded.perf_metrics.vlm_raw_metrics.adapter_query_state_durations =
+            perf_metrics.vlm_raw_metrics.adapter_query_state_durations;
+        decoded.perf_metrics.vlm_raw_metrics.adapter_set_lora_tensors_durations =
+            perf_metrics.vlm_raw_metrics.adapter_set_lora_tensors_durations;
+        decoded.perf_metrics.vlm_raw_metrics.adapter_set_constants_durations =
+            perf_metrics.vlm_raw_metrics.adapter_set_constants_durations;
         decoded.perf_metrics.vlm_raw_metrics.prepare_embeddings_durations.insert(
             decoded.perf_metrics.vlm_raw_metrics.prepare_embeddings_durations.end(),
             perf_metrics.vlm_raw_metrics.prepare_embeddings_durations.begin(),
@@ -913,7 +933,15 @@ private:
         }
 
         if (m_adapter_controller) {
+            const auto adapter_switch_start = std::chrono::steady_clock::now();
             m_adapter_controller->apply(m_language, generation_config.adapters);
+            auto& raw = perf_metrics.vlm_raw_metrics;
+            PerfMetrics::emplace_duration(raw.adapter_switch_durations, adapter_switch_start);
+            const auto profile = m_adapter_controller->get_last_apply_profile();
+            raw.adapter_prepare_weight_getters_durations.emplace_back(profile.prepare_weight_getters_us);
+            raw.adapter_query_state_durations.emplace_back(profile.query_state_us);
+            raw.adapter_set_lora_tensors_durations.emplace_back(profile.set_lora_tensors_us);
+            raw.adapter_set_constants_durations.emplace_back(profile.set_constants_us);
         }
 
         std::vector<SequenceGroup::Ptr> requests;
